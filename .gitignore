@@ -1,0 +1,19 @@
+# binaries / build
+bin/
+tmp/
+*.exe
+
+# env / secrets
+.env
+.env.local
+
+# logs
+logs/
+*.log
+
+# go
+vendor/
+
+# editor / OS
+.DS_Store
+.idea/
