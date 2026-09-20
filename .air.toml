@@ -1,0 +1,43 @@
+root = "."
+tmp_dir = "tmp"
+
+[build]
+  # Command to build the binary
+  cmd = "go build -o ./tmp/bin/server ./cmd/server"
+  # Path to the built binary air will run
+  bin = "./tmp/bin/server"
+  # Include all .go files in the build graph (not just those in watched dirs)
+  full_bin = ""
+  include_ext = ["go", "tpl", "tmpl", "html"]
+  exclude_dir = ["assets", "tmp", "vendor", ".git", "migrations", "loadtest", "deploy"]
+  exclude_file = []
+  include_dir = ["cmd", "internal"]
+  # Stop on build error instead of running the old binary
+  stop_on_error = true
+  # ms to wait before killing the running binary and restarting
+  kill_delay = "500ms"
+  # ms to wait after a file change before triggering a rebuild (debounce)
+  rerun_delay = 500
+  # Send an os.Interrupt signal before os.Kill (gives the binary a chance to
+  # handle graceful shutdown before air force-kills it)
+  send_interrupt = false
+
+[watch]
+  # 0 = use fsnotify (inotify on Linux); > 0 = polling interval in ms
+  poll_interval = 0
+
+[log]
+  # Show timestamps in air's own console output
+  time = true
+  # Path to air's own log file (build output, restart events)
+  log = "tmp/air.log"
+
+[color]
+  main = "magenta"
+  watcher = "cyan"
+  build = "yellow"
+  runner = "green"
+
+[misc]
+  # Remove the compiled binary when air exits
+  clean_on_exit = true
