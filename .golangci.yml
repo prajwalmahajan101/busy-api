@@ -1,0 +1,60 @@
+version: "2"
+
+run:
+  timeout: 5m
+  go: "1.26"
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - staticcheck
+    - gofmt
+    - gosec
+
+linters-settings:
+  errcheck:
+    # Check return values from type assertions (x := y.(T))
+    check-type-assertions: true
+    # Check assignments to the blank identifier (_ = fn())
+    check-blank: true
+
+  govet:
+    enable:
+      - shadow
+
+  staticcheck:
+    # Run all SA, S, ST, and QF check families
+    checks:
+      - "SA*"
+      - "S*"
+      - "ST*"
+      - "QF*"
+
+  gosec:
+    severity: medium
+    confidence: medium
+    # G304 — file path from variable: acceptable for config loading (godotenv)
+    # G107 — URL from variable: handled by httpclient.AssertPublicURL SSRF guard
+    excludes:
+      - G304
+      - G107
+
+  gofmt:
+    simplify: true
+
+issues:
+  # 0 = unlimited (report every issue)
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  # Do not suppress issues that have auto-fix suggestions
+  fix: false
+  # Report all issues, not only new ones relative to a base revision
+  new: false
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true
