@@ -68,7 +68,8 @@ async and off the hot path (Phase 7).
 | `ENV` | no | `local` | `local`/`staging`/`prod` — gates docs, HSTS, secret source |
 | `DATABASE_URL` | **yes** | — | `postgres://user:pass@host:5432/db?sslmode=disable` |
 | `DB_MAX_CONNS` | no | `4×cores` | pgxpool max conns |
-| `DB_CONN_TIMEOUT_MS` | no | `5000` | connect timeout |
+| `DB_CONN_TIMEOUT_MS` | no | `5000` | pgxpool connect timeout |
+| `DB_QUERY_TIMEOUT_MS` | no | `2000` | per-call query deadline (`context.WithTimeout` on every DB call) |
 | `VALKEY_URL` | no | `redis://localhost:6379/0` | resilience backend; empty ⇒ in-memory fallback |
 | `LOG_LEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR |
 | `LOG_JSON` | no | `true` | false ⇒ text handler |
@@ -328,8 +329,8 @@ Install: k6 binary (`brew`/`apt`/release). Not a Go dependency.
 - [ ] Secrets seam: `loadCloudSecrets(ctx) error` no-op stub that later fetches Secrets Manager and `os.Setenv`s before `env.Parse`.
 - [ ] `Makefile` targets: `run build test lint migrate-up migrate-down sqlc dev compose-up`.
 - [ ] `.air.toml`, `.golangci.yml` committed.
-- [ ] `git init` + `.gitignore` (`.env`, `bin/`, `tmp/`, `*.log`, `logs/`).
-- [ ] `go mod tidy`; drop `mongo-driver` if unimported.
+- [x] `git init` + `.gitignore` (`.env`, `bin/`, `tmp/`, `*.log`, `logs/`) — repo initialized.
+- [x] `go mod tidy`. Note: `mongo-driver/v2` is a required indirect dep of `gin v1.12.0` (`gin/binding` imports `bson`) — not removable.
 
 **Key signatures**
 ```go
@@ -392,7 +393,7 @@ Install outermost→innermost (mirror Python `install_core_middleware`).
 
 **Tasks (order = install order)**
 - [ ] `middleware.Recovery()` → 500 error envelope (replaces `gin.Recovery` default body).
-- [ ] `middleware.BodyLimit(maxBytes)` → 413 when `Content-Length` exceeds cap.
+- [ ] `middleware.BodyLimit(maxBytes)` → 413 when `Content-Length` exceeds cap, AND wrap `c.Request.Body` in `http.MaxBytesReader` so the cap holds when `Content-Length` is absent/chunked/understated.
 - [ ] `middleware.CORS(origins)` → allowlist; skip if `CORS_ORIGINS` empty.
 - [ ] `middleware.SecurityHeaders(env)` → HSTS (prod only), X-Content-Type-Options, X-Frame-Options=DENY, Referrer-Policy, CSP, Permissions-Policy.
 - [ ] `middleware.RequestID()` → accept inbound `X-Request-ID` matching `^[A-Za-z0-9-]{1,128}$`, else mint UUID; bind `reqcontext` + echo header.
@@ -431,9 +432,9 @@ func (s *Service[T]) SoftDelete(ctx, id int64) error
 - [ ] `internal/valkey` — `Client(alias string) (*redis.Client, error)` cached; parse `VALKEY_URL`; `Ping` health; empty URL ⇒ callers use in-memory impls.
 - [ ] `resilience/retry` — `Do(ctx, fn, opts) error`; delay `min(base·2^n, max)·U(0.5,1.5)`; stop on non-retryable (`TripsBreaker==false` and not transient).
 - [ ] `resilience/breaker` — `CLOSED/OPEN/HALF_OPEN`; `Breaker` interface; memory + valkey impls behind `provider.Get(name)`; `Call(ctx, fn)` raises `ServiceUnavailableError` when OPEN; counts only breaker-tripping errors.
-- [ ] `resilience/cache` — `Cache` interface (`Get/Set/Delete/Incr`), memory + valkey, fail-open, TTL, dataset-version invalidation.
+- [ ] `resilience/cache` — `Cache` interface (`Get/Set/Delete`), memory + valkey, fail-open, TTL, dataset-version invalidation.
 - [ ] `resilience/throttle` — sliding-window `Check(ctx, id, limit, window) (Result, error)`; scopes (user-tier/burst/global/endpoint/ip); `ParseRate("100/min")`; feeds Phase-2 rate-limit headers via a gin dependency `RateLimit(scope, rate)`.
-- [ ] `resilience/registry` — per-service config from `Config`; `Resilient(name, fn)` = breaker(retry(fn)).
+- [ ] `resilience/registry` — per-service config from `Config`; `Resilient(ctx, name, fn)` = breaker(retry(fn)).
 
 **Key signatures**
 ```go
@@ -449,7 +450,7 @@ func ParseRate(s string) (limit int, window time.Duration, err error)
 
 **Tasks**
 - [ ] `internal/httpclient` — pooled `*http.Client` (tuned `Transport`); per-call auth (bearer/basic/apikey/none); error mapping (timeout→`ExternalTimeoutError`, 5xx→`TransientError`, 4xx→`ExternalServiceError`); `Resilient` applied per service.
-- [ ] SSRF guard — `AssertPublicURL(url)` rejects private/loopback/link-local/metadata IPs before every request; `SafeHost(url)` for logging.
+- [ ] SSRF guard — validate the resolved IP **inside the transport `DialContext`** (on the `addr` being dialed) to defeat DNS-rebinding/TOCTOU; reject private/loopback/link-local/metadata IPs. `AssertPublicURL(url)` stays as a cheap early reject; `SafeHost(url)` for logging.
 - [ ] Log sanitization — `Sanitize(v)` masks sensitive keys (`password|token|secret|key|authorization`), truncates long strings/lists. Reused by Phase 7 body capture.
 - [ ] Crypto/S3/SES — **deferred** until a feature needs them.
 
@@ -494,7 +495,8 @@ bounded-queue + batch-writer design that is safe at 100K RPS.
   than row-level TTL delete at scale); `APILOG_TTL_DAYS` sets the window.
 
 **Tasks**
-- [ ] `migrations/000N_api_log.sql` — partitioned table `api_log` (by day), indexes on `request_id`, `timestamp`, `status`.
+- [ ] `migrations/000N_api_log.sql` — partitioned table `api_log` (by day), indexes on `request_id`, `timestamp`, `status`; include a `DEFAULT` partition.
+- [ ] Partition provisioning — `ensureAPILogPartitions(ctx, days)` at startup + daily: `CREATE TABLE … PARTITION OF api_log … IF NOT EXISTS` for the next N days (so inserts never fail on a day roll) and drop partitions older than `APILOG_TTL_DAYS`.
 - [ ] `internal/apilog/record.go` — `Record` struct + `Direction` enum.
 - [ ] `internal/apilog/collector.go` — bounded `chan Record`, `Enqueue` (non-blocking select-default drop + counter), `Dropped() uint64`.
 - [ ] `internal/apilog/worker.go` — drain + batch + timed flush; `Sink` interface.
