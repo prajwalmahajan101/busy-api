@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
+	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 )
 
 func main() {
@@ -32,7 +33,7 @@ func requestLogger(logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		start := time.Now()
 		id := uuid.NewString()
-		ctx := logging.WithRequestID(c.Request.Context(), id)
+		ctx := reqcontext.WithRequestID(c.Request.Context(), id)
 		c.Request = c.Request.WithContext(ctx)
 		c.Header("X-Request-ID", id)
 

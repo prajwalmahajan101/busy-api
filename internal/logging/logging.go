@@ -9,12 +9,9 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 	lumberjack "gopkg.in/natefinch/lumberjack.v2"
 )
-
-type ctxKey struct{}
-
-var requestIDKey = ctxKey{}
 
 // ctxHandler wraps a slog.Handler and injects request_id from context.
 // Equivalent to Python's RequestContextFilter.
@@ -23,21 +20,10 @@ type ctxHandler struct {
 }
 
 func (h ctxHandler) Handle(ctx context.Context, r slog.Record) error {
-	if id, ok := ctx.Value(requestIDKey).(string); ok && id != "" {
+	if id := reqcontext.RequestIDFromContext(ctx); id != "" {
 		r.AddAttrs(slog.String("request_id", id))
 	}
 	return h.Handler.Handle(ctx, r)
-}
-
-// WithRequestID returns a context carrying the request id.
-func WithRequestID(ctx context.Context, id string) context.Context {
-	return context.WithValue(ctx, requestIDKey, id)
-}
-
-// RequestIDFromContext reads the request id, "" if absent.
-func RequestIDFromContext(ctx context.Context) string {
-	id, _ := ctx.Value(requestIDKey).(string)
-	return id
 }
 
 // Setup builds the JSON logger and installs it as slog default.
