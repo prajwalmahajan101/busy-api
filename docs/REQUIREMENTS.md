@@ -212,4 +212,4 @@ Unknown errors → 500 generic envelope (no internal detail leaked).
 - Field encryption (Fernet / AES-256-GCM), S3/SES/PII utils — per feature need.
 - AWS Secrets Manager fetch — implement the Phase-0 seam on cloud deploy.
 - `queue` audit sink (Kafka/NATS → ClickHouse) — build when Postgres audit saturates on the 100K path.
-- CI (GitHub Actions) — after `git init` + remote.
+- CI (GitHub Actions) — added: `.github/workflows/ci.yml` (build · vet · test · golangci-lint). Integration job (real Postgres + Valkey) follows the `integration` build tag in Phase 3/4.
