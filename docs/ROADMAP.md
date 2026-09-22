@@ -580,7 +580,7 @@ asserts a span is exported to an in-test OTLP receiver.
 - `utils/s3`, `utils/ses`, `utils/crypto`, `utils/pii` — add per feature.
 - AWS Secrets Manager fetch — seam exists in Phase 0; implement when deploying to cloud.
 - `queue` sink real impl (Kafka/NATS + ClickHouse) — interface exists in Phase 7; build when Postgres audit saturates on the 100K path.
-- GitHub Actions CI — after `git init` + remote.
+- ~~GitHub Actions CI — after `git init` + remote.~~ Done: `.github/workflows/ci.yml` (build · vet · test · golangci-lint on push/PR). Integration-test job (Postgres + Valkey `services:`) added when the `integration` tag lands in Phase 3/4.
 
 ## Sequencing & effort
 
