@@ -2,6 +2,7 @@ package main
 
 import (
 	"log/slog"
+	"os"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +22,10 @@ func main() {
 		c.JSON(200, gin.H{"message": "pong"})
 	})
 
-	r.Run(":8000")
+	if err := r.Run(":8000"); err != nil {
+		logger.Error("server exited", "err", err)
+		os.Exit(1)
+	}
 }
 
 func requestLogger(logger *slog.Logger) gin.HandlerFunc {

@@ -11,50 +11,46 @@ linters:
     - errcheck
     - govet
     - staticcheck
-    - gofmt
     - gosec
+  settings:
+    govet:
+      enable:
+        - shadow
 
-linters-settings:
-  errcheck:
-    # Check return values from type assertions (x := y.(T))
-    check-type-assertions: true
-    # Check assignments to the blank identifier (_ = fn())
-    check-blank: true
+    staticcheck:
+      # Run all SA, S, ST, and QF check families
+      checks:
+        - "SA*"
+        - "S*"
+        - "ST*"
+        - "QF*"
 
-  govet:
-    enable:
-      - shadow
+    gosec:
+      severity: medium
+      confidence: medium
+      # G304 — file path from variable: acceptable for config loading (godotenv)
+      # G107 — URL from variable: handled by httpclient.AssertPublicURL SSRF guard
+      excludes:
+        - G304
+        - G107
 
-  staticcheck:
-    # Run all SA, S, ST, and QF check families
-    checks:
-      - "SA*"
-      - "S*"
-      - "ST*"
-      - "QF*"
-
-  gosec:
-    severity: medium
-    confidence: medium
-    # G304 — file path from variable: acceptable for config loading (godotenv)
-    # G107 — URL from variable: handled by httpclient.AssertPublicURL SSRF guard
-    excludes:
-      - G304
-      - G107
-
-  gofmt:
-    simplify: true
+# gofmt is a formatter in golangci-lint v2, not a linter.
+formatters:
+  enable:
+    - gofmt
+  settings:
+    gofmt:
+      simplify: true
 
 issues:
   # 0 = unlimited (report every issue)
   max-issues-per-linter: 0
   max-same-issues: 0
-  # Do not suppress issues that have auto-fix suggestions
-  fix: false
   # Report all issues, not only new ones relative to a base revision
   new: false
 
 output:
   formats:
-    - format: colored-line-number
-  sort-results: true
+    text:
+      path: stdout
+      colors: true
