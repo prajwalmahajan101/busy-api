@@ -1,8 +1,8 @@
 name: CI
 
+# PR-to-main only. Running on push to main too would re-run CI on the same
+# commit the PR already validated (rebase-merge keeps the tree identical).
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
 
