@@ -16,12 +16,12 @@ func setEnv(t *testing.T, key, value string) {
 	prev, had := os.LookupEnv(key)
 	t.Cleanup(func() {
 		if had {
-			os.Setenv(key, prev)
+			_ = os.Setenv(key, prev)
 		} else {
-			os.Unsetenv(key)
+			_ = os.Unsetenv(key)
 		}
 	})
-	os.Setenv(key, value)
+	_ = os.Setenv(key, value)
 }
 
 func unsetEnv(t *testing.T, key string) {
@@ -29,10 +29,10 @@ func unsetEnv(t *testing.T, key string) {
 	prev, had := os.LookupEnv(key)
 	t.Cleanup(func() {
 		if had {
-			os.Setenv(key, prev)
+			_ = os.Setenv(key, prev)
 		}
 	})
-	os.Unsetenv(key)
+	_ = os.Unsetenv(key)
 }
 
 // TestLoad_FailsFastOnMissingDatabaseURL verifies that Load returns a non-nil
