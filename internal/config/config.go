@@ -36,8 +36,13 @@ type Config struct {
 	// 0 means the runtime default (4 × CPU cores).
 	DBMaxConns int `env:"DB_MAX_CONNS" envDefault:"0"`
 
-	// DBConnTimeoutMS is the per-call connect timeout in milliseconds.
+	// DBConnTimeoutMS is the pgxpool connect timeout in milliseconds.
 	DBConnTimeoutMS int `env:"DB_CONN_TIMEOUT_MS" envDefault:"5000"`
+
+	// DBQueryTimeoutMS is the per-call query deadline in milliseconds, applied
+	// as context.WithTimeout on every DB call so a slow Postgres never stalls a
+	// goroutine indefinitely.
+	DBQueryTimeoutMS int `env:"DB_QUERY_TIMEOUT_MS" envDefault:"2000"`
 
 	// -------------------------------------------------------------------------
 	// Valkey / Redis

@@ -63,6 +63,7 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, "postgres://user:pass@localhost:5432/busyapi?sslmode=disable", cfg.DatabaseURL)
 	assert.Equal(t, 0, cfg.DBMaxConns)
 	assert.Equal(t, 5000, cfg.DBConnTimeoutMS)
+	assert.Equal(t, 2000, cfg.DBQueryTimeoutMS)
 
 	// Valkey
 	assert.Equal(t, "redis://localhost:6379/0", cfg.ValkeyURL)
