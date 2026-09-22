@@ -157,7 +157,8 @@ Unknown errors → 500 generic envelope (no internal detail leaked).
 | `ENV` | no | `local` | local/staging/prod — gates HSTS, docs, secret source |
 | `DATABASE_URL` | **yes** | — | `postgres://…?sslmode=disable` |
 | `DB_MAX_CONNS` | no | `4×cores` | pgxpool max |
-| `DB_CONN_TIMEOUT_MS` | no | `5000` | connect timeout |
+| `DB_CONN_TIMEOUT_MS` | no | `5000` | pgxpool connect timeout |
+| `DB_QUERY_TIMEOUT_MS` | no | `2000` | per-call query deadline (`context.WithTimeout` on every DB call) |
 | `VALKEY_URL` | no | `redis://localhost:6379/0` | empty ⇒ in-memory fallback |
 | `LOG_LEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR |
 | `LOG_JSON` | no | `true` | text if false |
