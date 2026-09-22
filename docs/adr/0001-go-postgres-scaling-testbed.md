@@ -10,7 +10,7 @@
 
 busy-api is a database-backed read API whose explicit purpose is to be scaled
 from 1 req/s to 100,000 req/s, proving each scaling technique with hard
-benchmark numbers (see `PRD.md`). The stack choice must therefore optimize for:
+benchmark numbers (see `docs/PRD.md`). The stack choice must therefore optimize for:
 
 - High single-node throughput (so we reach high rungs with few instances).
 - A clean, well-understood scaling path for the datastore (indexes → cache →
