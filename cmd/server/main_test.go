@@ -29,7 +29,7 @@ func doGet(t *testing.T, path string) (*httptest.ResponseRecorder, map[string]an
 	return w, env
 }
 
-func TestPing_SuccessEnvelope(t *testing.T) {
+func TestPingSuccessEnvelope(t *testing.T) {
 	w, env := doGet(t, "/ping")
 	assert.Equal(t, http.StatusOK, w.Code)
 	assert.Equal(t, true, env["success"])
@@ -38,7 +38,7 @@ func TestPing_SuccessEnvelope(t *testing.T) {
 	assert.NotEmpty(t, w.Header().Get("X-Request-ID"))
 }
 
-func TestError_TypedErrorEnvelope(t *testing.T) {
+func TestErrorTypedErrorEnvelope(t *testing.T) {
 	w, env := doGet(t, "/error")
 
 	assert.Equal(t, http.StatusNotFound, w.Code)
