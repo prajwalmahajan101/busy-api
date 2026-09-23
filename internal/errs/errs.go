@@ -22,12 +22,12 @@ func (e *AppError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
-func NewValidation(msg string, detials map[string]any) *AppError {
-	return &AppError{Code: "validation_error", Message: msg, HTTPStatus: 422, Details: detials}
+func NewValidation(msg string, details map[string]any) *AppError {
+	return &AppError{Code: "validation_error", Message: msg, HTTPStatus: 422, Details: details}
 }
 
 func NewNotFound(msg string) *AppError {
-	return &AppError{Code: "", Message: msg, HTTPStatus: 404}
+	return &AppError{Code: "not_found", Message: msg, HTTPStatus: 404}
 }
 
 func NewRateLimit(msg string) *AppError {
