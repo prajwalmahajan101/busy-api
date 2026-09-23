@@ -10,6 +10,7 @@ import (
 
 	"github.com/prajwalmahajan101/busyapi/internal/errs"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
+	"github.com/prajwalmahajan101/busyapi/internal/middleware"
 	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 	"github.com/prajwalmahajan101/busyapi/internal/response"
 )
@@ -29,7 +30,7 @@ func main() {
 // Extracted so tests can drive routes via httptest without binding a port.
 func newRouter(logger *slog.Logger) *gin.Engine {
 	r := gin.New()
-	r.Use(gin.Recovery())
+	r.Use(middleware.Recovery())
 	r.Use(requestLogger(logger))
 
 	r.GET("/ping", func(c *gin.Context) {
