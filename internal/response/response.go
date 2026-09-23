@@ -21,7 +21,7 @@ type ErrDetail struct {
 
 // Envelope is the uniform shape for every response.
 type Envelope struct {
-	Success   bool        `json:"sucess"`
+	Success   bool        `json:"success"`
 	Message   string      `json:"message"`
 	Data      any         `json:"data,omitempty"`
 	Errors    []ErrDetail `json:"errors,omitempty"`
@@ -55,12 +55,13 @@ func Error(c *gin.Context, err error) {
 			Errors:    []ErrDetail{{Code: ae.Code, Message: ae.Message, Details: ae.Details}},
 			RequestID: rid,
 		})
+		return
 	}
 
 	c.JSON(http.StatusInternalServerError, Envelope{
 		Success:   false,
 		Message:   "internal server error",
-		Errors:    []ErrDetail{{Code: "interal_error", Message: "internal server error"}},
+		Errors:    []ErrDetail{{Code: "internal_error", Message: "internal server error"}},
 		RequestID: rid,
 	})
 }
