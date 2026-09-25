@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prajwalmahajan101/busyapi/internal/config"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -15,8 +16,7 @@ import (
 
 func doGet(t *testing.T, path string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
-	gin.SetMode(gin.TestMode)
-	r := newRouter(logging.Setup())
+	r := testRouter()
 
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 	w := httptest.NewRecorder()
@@ -50,4 +50,10 @@ func TestErrorTypedErrorEnvelope(t *testing.T) {
 	require.Len(t, errsList, 1)
 	first := errsList[0].(map[string]any)
 	assert.Equal(t, "not_found", first["code"])
+}
+
+func testRouter() *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	cfg := &config.Config{MaxBodyBytes: 1 << 20, Env: "local"}
+	return newRouter(cfg, logging.Setup())
 }
