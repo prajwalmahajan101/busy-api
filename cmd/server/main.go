@@ -3,36 +3,55 @@ package main
 import (
 	"log/slog"
 	"os"
-	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/google/uuid"
 
+	"github.com/prajwalmahajan101/busyapi/internal/config"
 	"github.com/prajwalmahajan101/busyapi/internal/errs"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
 	"github.com/prajwalmahajan101/busyapi/internal/middleware"
-	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 	"github.com/prajwalmahajan101/busyapi/internal/response"
 )
 
 func main() {
 	logger := logging.Setup()
 
-	r := newRouter(logger)
+	cfg, err := config.Load()
+	if err != nil {
+		logger.Error("config load failed", "err", err)
+		os.Exit(1)
+	}
 
-	if err := r.Run(":8000"); err != nil {
+	r := newRouter(cfg, logger)
+
+	if err := r.Run(":" + cfg.Port); err != nil {
 		logger.Error("server exited", "err", err)
 		os.Exit(1)
 	}
 }
 
-// newRouter builds the Gin engine with the middleware stack and routes.
-// Extracted so tests can drive routes via httptest without binding a port.
-func newRouter(logger *slog.Logger) *gin.Engine {
+// newRouter builds the Gin engine: it installs the middleware stack in the
+// documented order (see design.md §Middleware Stack) then registers routes.
+// No business logic lives here.
+func newRouter(cfg *config.Config, logger *slog.Logger) *gin.Engine {
 	r := gin.New()
-	r.Use(middleware.Recovery())
-	r.Use(requestLogger(logger))
 
+	// Middleware stack, outermost first
+
+	r.Use(middleware.Recovery())
+	r.Use(middleware.BodyLimit(cfg.MaxBodyBytes))
+	r.Use(middleware.CORS(cfg.CORSOrigins))
+	r.Use(middleware.SecurityHeaders(cfg.Env))
+	r.Use(middleware.RequestID())
+	r.Use(middleware.RequestLogging(logger))
+	r.Use(middleware.RateLimitHeaders())
+
+	registerRoutes(r)
+	return r
+}
+
+// registerRoutes wires the HTTP routes. Real domain routes land in Phase 3.
+func registerRoutes(r *gin.Engine) {
 	r.GET("/ping", func(c *gin.Context) {
 		response.Success(c, 200, "pong", nil)
 	})
@@ -41,26 +60,4 @@ func newRouter(logger *slog.Logger) *gin.Engine {
 	r.GET("/error", func(c *gin.Context) {
 		response.Error(c, errs.NewNotFound("resource not found"))
 	})
-
-	return r
-}
-
-func requestLogger(logger *slog.Logger) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		start := time.Now()
-		id := uuid.NewString()
-		ctx := reqcontext.WithRequestID(c.Request.Context(), id)
-		c.Request = c.Request.WithContext(ctx)
-		c.Header("X-Request-ID", id)
-
-		c.Next()
-
-		logger.InfoContext(ctx, "request",
-			"method", c.Request.Method,
-			"path", c.Request.URL.Path,
-			"status", c.Writer.Status(),
-			"latency_ms", time.Since(start).Milliseconds(),
-			"client_ip", c.ClientIP(),
-		)
-	}
 }
