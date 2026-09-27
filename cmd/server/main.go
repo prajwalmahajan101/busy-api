@@ -1,13 +1,16 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"os"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/prajwalmahajan101/busyapi/internal/config"
+	"github.com/prajwalmahajan101/busyapi/internal/db"
 	"github.com/prajwalmahajan101/busyapi/internal/errs"
+	"github.com/prajwalmahajan101/busyapi/internal/items"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
 	"github.com/prajwalmahajan101/busyapi/internal/middleware"
 	"github.com/prajwalmahajan101/busyapi/internal/response"
@@ -22,7 +25,15 @@ func main() {
 		os.Exit(1)
 	}
 
+	pool, err := db.NewPool(context.Background(), cfg)
+	if err != nil {
+		logger.Error("db pool init failed", "err", err)
+		os.Exit(1)
+	}
+	defer db.Close(pool)
+
 	r := newRouter(cfg, logger)
+	items.NewHandler(items.NewService(pool)).RegisterRoutes(r)
 
 	if err := r.Run(":" + cfg.Port); err != nil {
 		logger.Error("server exited", "err", err)
