@@ -6,6 +6,7 @@ package db
 import (
 	"context"
 	"fmt"
+	"math"
 	"runtime"
 	"time"
 
@@ -33,7 +34,10 @@ func NewPool(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 	if maxConns <= 0 {
 		maxConns = 4 * runtime.NumCPU()
 	}
-	poolCfg.MaxConns = int32(maxConns)
+	if maxConns > math.MaxInt32 {
+		maxConns = math.MaxInt32
+	}
+	poolCfg.MaxConns = int32(maxConns) //nolint:gosec // clamped to <= MaxInt32 above
 	poolCfg.ConnConfig.ConnectTimeout = time.Duration(cfg.DBConnTimeoutMS) * time.Millisecond
 
 	queryTimeout = time.Duration(cfg.DBQueryTimeoutMS) * time.Millisecond

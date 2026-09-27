@@ -45,8 +45,9 @@ func ListPaginated[T any](ctx context.Context, countFn CountFunc, listFn ListFun
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: count: %w", err)
 	}
-	offset := int(offset64)
-	items, err := listFn(ctx, int32(size), int32(offset))
+	limit := int32(size)      //nolint:gosec // size clamped to [1, MaxPageSize]
+	offset := int32(offset64) //nolint:gosec // offset64 checked <= MaxInt32 above
+	items, err := listFn(ctx, limit, offset)
 	if err != nil {
 		return nil, 0, fmt.Errorf("store: list: %w", err)
 	}
