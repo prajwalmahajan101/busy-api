@@ -21,7 +21,6 @@ Gin · pgx/v5 + sqlc · goose · Valkey (go-redis) · OpenTelemetry → Tempo/Pr
 
 ```bash
 cp .env.example .env          # set DATABASE_URL
-docker compose up -d valkey   # cache/resilience backend
 make run                      # boot API on :8000
 curl -s localhost:8000/ping | jq
 ```

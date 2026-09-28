@@ -40,7 +40,6 @@ DB_DRIVER      := postgres
         migrate-up migrate-down \
         sqlc \
         dev \
-        compose-up compose-down \
         obs-up obs-down \
         load-smoke load load-stress load-spike load-soak load-matrix
 
@@ -127,14 +126,9 @@ dev: ## Start the development server with hot-reload (requires air)
 	air
 
 # ---------------------------------------------------------------------------
-# Docker Compose — main stack (Valkey)
+# Backing services (Postgres + Valkey) run as shared external stacks; see
+# ../../docker/postgres and ../../docker/val. No project-local compose.
 # ---------------------------------------------------------------------------
-
-compose-up: ## Start the main docker-compose stack (Valkey) in detached mode
-	docker compose up -d
-
-compose-down: ## Stop and remove the main docker-compose stack
-	docker compose down
 
 # ---------------------------------------------------------------------------
 # Docker Compose — observability stack

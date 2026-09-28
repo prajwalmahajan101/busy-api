@@ -88,8 +88,8 @@ func TestItemsCRUD_Integration(t *testing.T) {
 	}
 
 	// Soft-delete first item → excluded from list and count.
-	if err := svc.SoftDelete(ctx, page1[0].ID); err != nil {
-		t.Fatalf("soft delete: %v", err)
+	if delErr := svc.SoftDelete(ctx, page1[0].ID); delErr != nil {
+		t.Fatalf("soft delete: %v", delErr)
 	}
 	_, total, err = svc.List(ctx, 1, 10)
 	if err != nil {
