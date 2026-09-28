@@ -13,7 +13,9 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/items"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
 	"github.com/prajwalmahajan101/busyapi/internal/middleware"
+	"github.com/prajwalmahajan101/busyapi/internal/resilience/throttle"
 	"github.com/prajwalmahajan101/busyapi/internal/response"
+	"github.com/prajwalmahajan101/busyapi/internal/valkey"
 )
 
 func main() {
@@ -32,8 +34,24 @@ func main() {
 	}
 	defer db.Close(pool)
 
+	valkey.Configure(cfg.ValkeyURL)
+	rdb, err := valkey.Client("default")
+	if err != nil {
+		logger.Error("valkey init failed", "err", err)
+		os.Exit(1)
+	}
+	defer func() { _ = valkey.Close() }()
+
+	throttler := throttle.New(rdb)
+	limit, window, err := throttle.ParseRate("100/min")
+	if err != nil {
+		logger.Error("bad rate", "err", err)
+		os.Exit(1)
+	}
+
 	r := newRouter(cfg, logger)
-	items.NewHandler(items.NewService(pool)).RegisterRoutes(r)
+	limited := r.Group("", middleware.Throttle(throttler, limit, window))
+	items.NewHandler(items.NewService(pool)).RegisterRoutes(limited)
 
 	if err := r.Run(":" + cfg.Port); err != nil {
 		logger.Error("server exited", "err", err)
