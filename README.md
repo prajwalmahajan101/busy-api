@@ -21,11 +21,6 @@ Gin · pgx/v5 + sqlc · goose · Valkey (go-redis) · OpenTelemetry → Tempo/Pr
 
 ```bash
 cp .env.example .env          # set DATABASE_URL
-
-# Backing services run as shared external stacks:
-docker compose -f ../../docker/postgres/docker-compose.yaml up -d   # Postgres
-docker compose -f ../../docker/val/docker-compose.yaml up -d        # Valkey
-
 make run                      # boot API on :8000
 curl -s localhost:8000/ping | jq
 ```
