@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 
 	"github.com/prajwalmahajan101/busyapi/internal/config"
 	"github.com/prajwalmahajan101/busyapi/internal/db"
@@ -18,45 +21,60 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/valkey"
 )
 
+// defaultRate is the per-IP request budget applied to domain routes.
+const defaultRate = "100/min"
+
 func main() {
 	logger := logging.Setup()
+	if err := run(logger); err != nil {
+		logger.Error("startup failed", "err", err)
+		os.Exit(1)
+	}
+}
 
+// run wires dependencies, builds the router, and serves. Returning an error
+// keeps a single exit point and lets deferred cleanup run before the process
+// exits.
+func run(logger *slog.Logger) error {
 	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("config load failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("config load: %w", err)
 	}
 
 	pool, err := db.NewPool(context.Background(), cfg)
 	if err != nil {
-		logger.Error("db pool init failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("db pool init: %w", err)
 	}
 	defer db.Close(pool)
 
 	valkey.Configure(cfg.ValkeyURL)
 	rdb, err := valkey.Client("default")
 	if err != nil {
-		logger.Error("valkey init failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("valkey init: %w", err)
 	}
 	defer func() { _ = valkey.Close() }()
 
-	throttler := throttle.New(rdb)
-	limit, window, err := throttle.ParseRate("100/min")
+	r, err := buildRouter(cfg, logger, pool, rdb)
 	if err != nil {
-		logger.Error("bad rate", "err", err)
-		os.Exit(1)
+		return err
 	}
 
+	return r.Run(":" + cfg.Port)
+}
+
+// buildRouter assembles the middleware stack and registers domain routes behind
+// the per-IP throttle.
+func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.Client) (*gin.Engine, error) {
 	r := newRouter(cfg, logger)
-	limited := r.Group("", middleware.Throttle(throttler, limit, window))
+
+	limit, window, err := throttle.ParseRate(defaultRate)
+	if err != nil {
+		return nil, fmt.Errorf("throttle rate %q: %w", defaultRate, err)
+	}
+	limited := r.Group("", middleware.Throttle(throttle.New(rdb), limit, window))
 	items.NewHandler(items.NewService(pool)).RegisterRoutes(limited)
 
-	if err := r.Run(":" + cfg.Port); err != nil {
-		logger.Error("server exited", "err", err)
-		os.Exit(1)
-	}
+	return r, nil
 }
 
 // newRouter builds the Gin engine: it installs the middleware stack in the
