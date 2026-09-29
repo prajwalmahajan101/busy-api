@@ -22,36 +22,49 @@ func (e *AppError) Error() string {
 	return e.Code + ": " + e.Message
 }
 
+// Code values are stable machine-readable error identifiers, shared across the
+// app and the API error envelope. The single source of truth for error codes.
+const (
+	CodeValidation      = "validation_error"
+	CodeNotFound        = "not_found"
+	CodeRateLimited     = "rate_limited"
+	CodeInfrastructure  = "infrastructure_error"
+	CodeUnavailable     = "service_unavailable"
+	CodeExternal        = "external_error"
+	CodeTransient       = "transient_error"
+	CodeExternalTimeout = "external_timeout"
+)
+
 func NewValidation(msg string, details map[string]any) *AppError {
-	return &AppError{Code: "validation_error", Message: msg, HTTPStatus: 422, Details: details}
+	return &AppError{Code: CodeValidation, Message: msg, HTTPStatus: 422, Details: details}
 }
 
 func NewNotFound(msg string) *AppError {
-	return &AppError{Code: "not_found", Message: msg, HTTPStatus: 404}
+	return &AppError{Code: CodeNotFound, Message: msg, HTTPStatus: 404}
 }
 
 func NewRateLimit(msg string) *AppError {
-	return &AppError{Code: "rate_limited", Message: msg, HTTPStatus: 429}
+	return &AppError{Code: CodeRateLimited, Message: msg, HTTPStatus: 429}
 }
 
 func NewInfrastructure(msg string) *AppError {
-	return &AppError{Code: "infrastructure_error", Message: msg, HTTPStatus: 500}
+	return &AppError{Code: CodeInfrastructure, Message: msg, HTTPStatus: 500}
 }
 
 func NewServiceUnavailable(service string) *AppError {
-	return &AppError{Code: "service_unavailable", Message: service + " unavailable", HTTPStatus: 503}
+	return &AppError{Code: CodeUnavailable, Message: service + " unavailable", HTTPStatus: 503}
 }
 
 func NewExternal(msg string) *AppError {
-	return &AppError{Code: "external_error", Message: msg, HTTPStatus: 502, trips: true}
+	return &AppError{Code: CodeExternal, Message: msg, HTTPStatus: 502, trips: true}
 }
 
 func NewTransient(msg string) *AppError {
-	return &AppError{Code: "transient_error", Message: msg, HTTPStatus: 502, trips: true}
+	return &AppError{Code: CodeTransient, Message: msg, HTTPStatus: 502, trips: true}
 }
 
 func NewExternalTimeout(msg string) *AppError {
-	return &AppError{Code: "external_timeout", Message: msg, HTTPStatus: 502, trips: true}
+	return &AppError{Code: CodeExternalTimeout, Message: msg, HTTPStatus: 502, trips: true}
 }
 
 // TripsBreaker reports whether err (or any AppError it wraps) should count as a
