@@ -17,11 +17,11 @@ const (
 	msgInternalServer    = "internal server error"
 )
 
-// requestIDHeader is the inbound/outbound header carrying the request id.
-const requestIDHeader = "X-Request-ID"
-
-// gin context keys owned by this package.
+// String keys owned by this package: the request-id header and the gin context
+// keys the middleware chain reads and writes.
 const (
+	// requestIDHeader carries the request id inbound and outbound.
+	requestIDHeader = "X-Request-ID"
 	// ctxRateLimit is where the throttle layer stores the per-request rate-limit
 	// result; RateLimitHeaders reads it. Keeping the key here decouples
 	// RateLimitHeaders from the throttle package.
