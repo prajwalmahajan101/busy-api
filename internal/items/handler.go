@@ -52,7 +52,7 @@ type createReq struct {
 func (h *Handler) create(c *gin.Context) {
 	var req createReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, errs.NewValidation("invalid request body", nil))
+		response.Error(c, errs.NewValidation(msgInvalidBody, nil))
 		return
 	}
 	item, err := h.svc.Create(c.Request.Context(), req.Notes)
@@ -122,7 +122,7 @@ func (h *Handler) hardDelete(c *gin.Context) {
 func parseID(c *gin.Context) (int64, error) {
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id < 1 {
-		return 0, errs.NewValidation("invalid id", nil)
+		return 0, errs.NewValidation(msgInvalidID, nil)
 	}
 	return id, nil
 }

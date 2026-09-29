@@ -14,6 +14,19 @@ import (
 	storedb "github.com/prajwalmahajan101/busyapi/internal/store/db"
 )
 
+// Error messages emitted by this package, named so handler and service share one
+// source and tests can assert on them.
+const (
+	msgCreateFailed     = "create item failed"
+	msgItemNotFound     = "item not found"
+	msgGetFailed        = "get item failed"
+	msgListFailed       = "list item failed"
+	msgSoftDeleteFailed = "soft delete failed"
+	msgDeleteFailed     = "delete item failed"
+	msgInvalidBody      = "invalid request body"
+	msgInvalidID        = "invalid id"
+)
+
 // Service is the business layer over the sqlc store. Every call runs under the
 // DB query timeout
 type Service struct {
@@ -30,7 +43,7 @@ func (s *Service) Create(ctx context.Context, notes []byte) (storedb.Item, error
 	defer cancel()
 	item, err := s.q.CreateItem(ctx, notes)
 	if err != nil {
-		return storedb.Item{}, errs.NewInfrastructure("create item failed")
+		return storedb.Item{}, errs.NewInfrastructure(msgCreateFailed)
 	}
 	return item, nil
 }
@@ -42,9 +55,9 @@ func (s *Service) Get(ctx context.Context, id int64) (storedb.Item, error) {
 	item, err := s.q.GetItem(ctx, id)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return storedb.Item{}, errs.NewNotFound("item not found")
+			return storedb.Item{}, errs.NewNotFound(msgItemNotFound)
 		}
-		return storedb.Item{}, errs.NewInfrastructure("get item failed")
+		return storedb.Item{}, errs.NewInfrastructure(msgGetFailed)
 	}
 	return item, nil
 }
@@ -57,7 +70,7 @@ func (s *Service) List(ctx context.Context, page, size int) ([]storedb.Item, int
 	}
 	items, total, err := store.ListPaginated(ctx, s.q.CountItems, listFn, page, size)
 	if err != nil {
-		return nil, 0, errs.NewInfrastructure("list item failed")
+		return nil, 0, errs.NewInfrastructure(msgListFailed)
 	}
 
 	return items, total, nil
@@ -67,7 +80,7 @@ func (s *Service) SoftDelete(ctx context.Context, id int64) error {
 	ctx, cancel := db.WithQueryTimeout(ctx)
 	defer cancel()
 	if err := store.SoftDelete(ctx, s.q.SoftDeleteItem, id); err != nil {
-		return errs.NewInfrastructure("soft delete failed")
+		return errs.NewInfrastructure(msgSoftDeleteFailed)
 	}
 
 	return nil
@@ -78,7 +91,7 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 	defer cancel()
 
 	if err := s.q.DeleteItem(ctx, id); err != nil {
-		return errs.NewInfrastructure("delete item failed")
+		return errs.NewInfrastructure(msgDeleteFailed)
 	}
 	return nil
 }
