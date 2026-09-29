@@ -17,6 +17,20 @@ const (
 	msgInternalServer    = "internal server error"
 )
 
+// requestIDHeader is the inbound/outbound header carrying the request id.
+const requestIDHeader = "X-Request-ID"
+
+// gin context keys owned by this package.
+const (
+	// ctxRateLimit is where the throttle layer stores the per-request rate-limit
+	// result; RateLimitHeaders reads it. Keeping the key here decouples
+	// RateLimitHeaders from the throttle package.
+	ctxRateLimit = "rate_limit_result"
+	// ctxServiceMS / ctxRepoMS accumulate per-layer timing for the access log.
+	ctxServiceMS = "timing_service_ms"
+	ctxRepoMS    = "timing_repo_ms"
+)
+
 // Setup installs the global middleware chain onto r in required order: Recovery
 // outermost (catches panics from everything inside), then BodyLimit, CORS,
 // SecurityHeaders, RequestID (before logging so access logs carry the id),

@@ -8,12 +8,6 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 )
 
-// gin context keys for per-layer timing accumulation.
-const (
-	ctxServiceMS = "timing_service_ms"
-	ctxRepoMS    = "timing_repo_ms"
-)
-
 // RequestLogging writes one structured access-log line after the handler
 // returns, carrying per-layer timings and the request id from reqcontext.
 func RequestLogging(logger *slog.Logger) gin.HandlerFunc {

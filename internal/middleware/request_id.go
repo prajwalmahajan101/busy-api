@@ -8,8 +8,6 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 )
 
-const requestIDHeader = "X-Request-ID"
-
 var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9-]{1,128}$`)
 
 // RequestID adopts a valid inbound X-Request-ID header or mints a UUIDv4,

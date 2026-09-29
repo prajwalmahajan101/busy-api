@@ -6,11 +6,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ctxRateLimit is the gin context key under which the throttle layer stores the
-// per-request rate-limit result. Keeping the key and type here decouples
-// RateLimitHeaders from the throttle package
-const ctxRateLimit = "rate_limit_result"
-
 // RateLimitResult is the minimal rate-limit data RateLimitHeaders emits. The
 // throttle middleware populates it via SetRateLimitResult; this package owns
 // the contract so throttle need not be imported here.
