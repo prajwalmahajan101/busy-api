@@ -65,36 +65,28 @@ func run(logger *slog.Logger) error {
 	return r.Run(":" + cfg.Port)
 }
 
-// buildRouter assembles the middleware stack and registers domain routes behind
-// the per-IP throttle.
+// buildRouter builds the Gin engine: it installs the middleware stack in the
+// documented order (see design.md §Middleware Stack), builds the per-IP throttle
+// group, then registers every route. No business logic lives here.
 func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, rdb *redis.Client) (*gin.Engine, error) {
-	r := newRouter(cfg, logger)
+	r := gin.New()
+
+	// Middleware stack, outermost first
+	middleware.Setup(r, cfg, logger)
 
 	limit, window, err := throttle.ParseRate(defaultRate)
 	if err != nil {
 		return nil, fmt.Errorf("throttle rate %q: %w", defaultRate, err)
 	}
 	limited := r.Group("", middleware.Throttle(throttle.New(rdb), limit, window))
-	items.NewHandler(items.NewService(pool)).RegisterRoutes(limited)
 
+	registerRoutes(r, limited, pool)
 	return r, nil
 }
 
-// newRouter builds the Gin engine: it installs the middleware stack in the
-// documented order (see design.md §Middleware Stack) then registers routes.
-// No business logic lives here.
-func newRouter(cfg *config.Config, logger *slog.Logger) *gin.Engine {
-	r := gin.New()
-
-	// Middleware stack, outermost first
-	middleware.Setup(r, cfg, logger)
-
-	registerRoutes(r)
-	return r
-}
-
-// registerRoutes wires the HTTP routes. Real domain routes land in Phase 3.
-func registerRoutes(r *gin.Engine) {
+// registerRoutes is the single home for every HTTP route: infra routes on the
+// root engine, domain routes on the throttled group.
+func registerRoutes(r *gin.Engine, limited gin.IRouter, pool *pgxpool.Pool) {
 	r.GET("/ping", func(c *gin.Context) {
 		response.Success(c, 200, "pong", nil)
 	})
@@ -103,4 +95,6 @@ func registerRoutes(r *gin.Engine) {
 	r.GET("/error", func(c *gin.Context) {
 		response.Error(c, errs.NewNotFound(msgResourceNotFound))
 	})
+
+	items.NewHandler(items.NewService(pool)).RegisterRoutes(limited)
 }
