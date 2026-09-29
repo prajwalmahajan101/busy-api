@@ -174,6 +174,33 @@ type Config struct {
 
 	// OtelMetricExportIntervalMS is the metric export period in milliseconds.
 	OtelMetricExportIntervalMS int `env:"OTEL_METRIC_EXPORT_INTERVAL_MS" envDefault:"10000"`
+
+	// -------------------------------------------------------------------------
+	// Outbound HTTP
+	// -------------------------------------------------------------------------
+
+	// HTTPTimeoutMS is the per-call deadline for outbound HTTP requests.
+	HTTPTimeoutMS int `env:"HTTP_TIMEOUT_MS" envDefault:"5000"`
+
+	// HTTPDialTimeoutMS is the TCP dial timeout for outbound connections.
+	HTTPDialTimeoutMS int `env:"HTTP_DIAL_TIMEOUT_MS" envDefault:"2000"`
+
+	// HTTPMaxIdleConns is the total idle connection pool size across all hosts.
+	HTTPMaxIdleConns int `env:"HTTP_MAX_IDLE_CONNS" envDefault:"100"`
+
+	// HTTPMaxIdleConnsPerHost caps idle connections retained per upstream host.
+	HTTPMaxIdleConnsPerHost int `env:"HTTP_MAX_IDLE_CONNS_PER_HOST" envDefault:"10"`
+
+	// HTTPIdleConnTimeoutS is how long an idle connection is kept before close.
+	HTTPIdleConnTimeoutS int `env:"HTTP_IDLE_CONN_TIMEOUT_S" envDefault:"90"`
+
+	// HTTPAllowPrivateIPs disables the SSRF guard's private/loopback/link-local
+	// rejection. Keep false in prod; enable only for local-dev upstreams.
+	HTTPAllowPrivateIPs bool `env:"HTTP_ALLOW_PRIVATE_IPS" envDefault:"false"`
+
+	// LogMaxValueLen caps the length of any single sanitized string/body value
+	// before truncation, bounding log volume.
+	LogMaxValueLen int `env:"LOG_MAX_VALUE_LEN" envDefault:"512"`
 }
 
 // Load reads configuration from the environment, optionally pre-loading a
