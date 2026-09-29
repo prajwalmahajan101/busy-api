@@ -24,6 +24,9 @@ import (
 // defaultRate is the per-IP request budget applied to domain routes.
 const defaultRate = "100/min"
 
+// msgResourceNotFound is the body for the catch-all no-route handler.
+const msgResourceNotFound = "resource not found"
+
 func main() {
 	logger := logging.Setup()
 	if err := run(logger); err != nil {
@@ -84,14 +87,7 @@ func newRouter(cfg *config.Config, logger *slog.Logger) *gin.Engine {
 	r := gin.New()
 
 	// Middleware stack, outermost first
-
-	r.Use(middleware.Recovery())
-	r.Use(middleware.BodyLimit(cfg.MaxBodyBytes))
-	r.Use(middleware.CORS(cfg.CORSOrigins))
-	r.Use(middleware.SecurityHeaders(cfg.Env))
-	r.Use(middleware.RequestID())
-	r.Use(middleware.RequestLogging(logger))
-	r.Use(middleware.RateLimitHeaders())
+	middleware.Setup(r, cfg, logger)
 
 	registerRoutes(r)
 	return r
@@ -105,6 +101,6 @@ func registerRoutes(r *gin.Engine) {
 
 	// Temporary route proving the error envelope; drops once real routes land.
 	r.GET("/error", func(c *gin.Context) {
-		response.Error(c, errs.NewNotFound("resource not found"))
+		response.Error(c, errs.NewNotFound(msgResourceNotFound))
 	})
 }

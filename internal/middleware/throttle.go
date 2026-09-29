@@ -25,7 +25,7 @@ func Throttle(t throttle.Throttler, limit int, window time.Duration) gin.Handler
 		// where response.Error writes the body immediately.
 		WriteRateLimitHeaders(c, RateLimitResult{Limit: res.Limit, Remaining: res.Remaining, Reset: res.Reset})
 		if !res.Allowed {
-			response.Error(c, errs.NewRateLimit("rate limit exceeded"))
+			response.Error(c, errs.NewRateLimit(msgRateLimitExceeded))
 			c.Abort()
 			return
 		}
