@@ -44,16 +44,15 @@ func run(logger *slog.Logger) error {
 		return fmt.Errorf("config load: %w", err)
 	}
 
-	pool, err := db.NewPool(context.Background(), cfg)
+	pool, err := initDB(context.Background(), cfg)
 	if err != nil {
-		return fmt.Errorf("db pool init: %w", err)
+		return err
 	}
 	defer db.Close(pool)
 
-	valkey.Configure(cfg.ValkeyURL)
-	rdb, err := valkey.Client("default")
+	rdb, err := initValkey(cfg)
 	if err != nil {
-		return fmt.Errorf("valkey init: %w", err)
+		return err
 	}
 	defer func() { _ = valkey.Close() }()
 
@@ -63,6 +62,26 @@ func run(logger *slog.Logger) error {
 	}
 
 	return r.Run(":" + cfg.Port)
+}
+
+// initDB opens the Postgres connection pool. The caller owns closing it.
+func initDB(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
+	pool, err := db.NewPool(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("db pool init: %w", err)
+	}
+	return pool, nil
+}
+
+// initValkey configures and dials the default Valkey client. The caller owns
+// closing it via valkey.Close.
+func initValkey(cfg *config.Config) (*redis.Client, error) {
+	valkey.Configure(cfg.ValkeyURL)
+	rdb, err := valkey.Client("default")
+	if err != nil {
+		return nil, fmt.Errorf("valkey init: %w", err)
+	}
+	return rdb, nil
 }
 
 // buildRouter builds the Gin engine: it installs the middleware stack in the
