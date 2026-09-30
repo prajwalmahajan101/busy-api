@@ -49,7 +49,7 @@ truth for **what** the system must do and the constraints it must meet.
 
 ### 4.3 Reliability & resilience
 - **NFR-R1:** Outbound calls wrapped in circuit breaker (CLOSED/OPEN/HALF_OPEN) + retry with exponential backoff + jitter.
-- **NFR-R2:** Circuit breaker trips only on external/transient/timeout errors, never on business 4xx.
+- **NFR-R2:** Circuit breaker trips only on **transient/timeout** errors (5xx, network, timeout); never on business 4xx or an upstream 4xx rejection (`ExternalServiceError`) — a 4xx means the upstream is healthy and rejected our request, so retrying/tripping would be wrong.
 - **NFR-R3:** Graceful shutdown on SIGINT/SIGTERM: stop accepting → drain in-flight → flush audit buffer → flush telemetry → close pools.
 - **NFR-R4:** Audit buffer is bounded; overflow drops records (counted), never blocks or OOMs.
 
@@ -143,7 +143,7 @@ Target: sub-ms p50 overhead. Postgres is the ceiling before this shows.
 | `RateLimitError` | 429 | no |
 | `InfrastructureError` | 500 | no |
 | `ServiceUnavailableError` | 503 | no (breaker source) |
-| `ExternalServiceError` | 502 | yes |
+| `ExternalServiceError` | 502 | no |
 | `TransientError` | 502 | yes |
 | `ExternalTimeoutError` | 502 | yes |
 

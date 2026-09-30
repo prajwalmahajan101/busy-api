@@ -117,11 +117,13 @@ maps it into the error envelope.
 | `RateLimitError` | 429 | no | `rate_limit.RateLimitError` |
 | `InfrastructureError` | 500 | no | `infrastructure.InfrastructureError` |
 | `ServiceUnavailableError` | 503 | no (breaker source) | `infrastructure.ServiceUnavailableError` |
-| `ExternalServiceError` | 502 | **yes** | `infrastructure.ExternalServiceError` |
+| `ExternalServiceError` | 502 | no | `infrastructure.ExternalServiceError` |
 | `TransientError` | 502 | **yes** | `infrastructure.TransientError` |
 | `ExternalTimeoutError` | 502 | **yes** | `infrastructure.ExternalTimeoutError` |
 
-Business errors (422/404/429) never trip the breaker; only external/transient/timeout do.
+Business errors (422/404/429) never trip the breaker; nor does `ExternalServiceError`
+(an upstream 4xx rejection — the upstream is healthy). Only `TransientError` and
+`ExternalTimeoutError` (5xx / network / timeout) trip it.
 
 ## Idiom translation (Python → Go)
 
