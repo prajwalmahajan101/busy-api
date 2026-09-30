@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/prajwalmahajan101/busyapi/internal/config"
 	"github.com/prajwalmahajan101/busyapi/internal/db"
@@ -16,59 +18,67 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/response"
 )
 
+// msgResourceNotFound is the body for the temporary error route.
+const msgResourceNotFound = "resource not found"
+
 func main() {
 	logger := logging.Setup()
-
-	cfg, err := config.Load()
-	if err != nil {
-		logger.Error("config load failed", "err", err)
+	if err := run(logger); err != nil {
+		logger.Error("startup failed", "err", err)
 		os.Exit(1)
 	}
+}
 
-	pool, err := db.NewPool(context.Background(), cfg)
+// run wires dependencies, builds the router, and serves. Returning an error
+// keeps a single exit point and lets deferred cleanup run before the process
+// exits.
+func run(logger *slog.Logger) error {
+	cfg, err := config.Load()
 	if err != nil {
-		logger.Error("db pool init failed", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("config load: %w", err)
+	}
+
+	pool, err := initDB(context.Background(), cfg)
+	if err != nil {
+		return err
 	}
 	defer db.Close(pool)
 
-	r := newRouter(cfg, logger)
-	items.NewHandler(items.NewService(pool)).RegisterRoutes(r)
-
-	if err := r.Run(":" + cfg.Port); err != nil {
-		logger.Error("server exited", "err", err)
-		os.Exit(1)
-	}
+	r := buildRouter(cfg, logger, pool)
+	return r.Run(":" + cfg.Port)
 }
 
-// newRouter builds the Gin engine: it installs the middleware stack in the
-// documented order (see design.md §Middleware Stack) then registers routes.
-// No business logic lives here.
-func newRouter(cfg *config.Config, logger *slog.Logger) *gin.Engine {
+// initDB opens the Postgres connection pool. The caller owns closing it.
+func initDB(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
+	pool, err := db.NewPool(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("db pool init: %w", err)
+	}
+	return pool, nil
+}
+
+// buildRouter builds the Gin engine: it installs the middleware stack in the
+// documented order via middleware.Setup, then registers every route. No
+// business logic lives here. The per-IP throttle group returns at rung 5 (T30),
+// when the resilience/throttle backend is re-introduced.
+func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) *gin.Engine {
 	r := gin.New()
-
-	// Middleware stack, outermost first
-
-	r.Use(middleware.Recovery())
-	r.Use(middleware.BodyLimit(cfg.MaxBodyBytes))
-	r.Use(middleware.CORS(cfg.CORSOrigins))
-	r.Use(middleware.SecurityHeaders(cfg.Env))
-	r.Use(middleware.RequestID())
-	r.Use(middleware.RequestLogging(logger))
-	r.Use(middleware.RateLimitHeaders())
-
-	registerRoutes(r)
+	middleware.Setup(r, cfg, logger)
+	registerRoutes(r, pool)
 	return r
 }
 
-// registerRoutes wires the HTTP routes. Real domain routes land in Phase 3.
-func registerRoutes(r *gin.Engine) {
+// registerRoutes is the single home for every HTTP route: infra routes and, for
+// now, domain routes on the root engine.
+func registerRoutes(r *gin.Engine, pool *pgxpool.Pool) {
 	r.GET("/ping", func(c *gin.Context) {
 		response.Success(c, 200, "pong", nil)
 	})
 
 	// Temporary route proving the error envelope; drops once real routes land.
 	r.GET("/error", func(c *gin.Context) {
-		response.Error(c, errs.NewNotFound("resource not found"))
+		response.Error(c, errs.NewNotFound(msgResourceNotFound))
 	})
+
+	items.NewHandler(items.NewService(pool)).RegisterRoutes(r)
 }

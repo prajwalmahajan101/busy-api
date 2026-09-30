@@ -6,11 +6,6 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ctxRateLimit is the gin context key under which the throttle layer stores the
-// per-request rate-limit result. Keeping the key and type here decouples
-// RateLimitHeaders from the throttle package
-const ctxRateLimit = "rate_limit_result"
-
 // RateLimitResult is the minimal rate-limit data RateLimitHeaders emits. The
 // throttle middleware populates it via SetRateLimitResult; this package owns
 // the contract so throttle need not be imported here.
@@ -26,6 +21,16 @@ func SetRateLimitResult(c *gin.Context, r RateLimitResult) {
 	c.Set(ctxRateLimit, r)
 }
 
+// WriteRateLimitHeaders emits the three X-RateLimit-* headers. It must be called
+// before the response body is written; the throttle middleware calls it directly
+// so the headers survive on the 429 path too.
+func WriteRateLimitHeaders(c *gin.Context, r RateLimitResult) {
+	h := c.Writer.Header()
+	h.Set("X-RateLimit-Limit", strconv.Itoa(r.Limit))
+	h.Set("X-RateLimit-Remaining", strconv.Itoa(r.Remaining))
+	h.Set("X-RateLimit-Reset", strconv.FormatInt(r.Reset, 10))
+}
+
 // RateLimitHeaders writes X-RateLimit-Limit/Remaining/Reset from a
 // RateLimitResult previously stored on the context. No-op when absent, so it is
 // safe on endpoints without rate limiting.
@@ -33,10 +38,7 @@ func RateLimitHeaders() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if v, ok := c.Get(ctxRateLimit); ok {
 			if r, ok := v.(RateLimitResult); ok {
-				h := c.Writer.Header()
-				h.Set("X-RateLimit-Limit", strconv.Itoa(r.Limit))
-				h.Set("X-RateLimit-Remaining", strconv.Itoa(r.Remaining))
-				h.Set("X-RateLimit-Reset", strconv.FormatInt(r.Reset, 10))
+				WriteRateLimitHeaders(c, r)
 			}
 		}
 		c.Next()

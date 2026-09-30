@@ -40,10 +40,6 @@ func BodyLimit(maxBytes int64) gin.HandlerFunc {
 }
 
 func abortTooLarge(c *gin.Context) {
-	response.Error(c, &errs.AppError{
-		Code:       "payload_too_large",
-		Message:    "request body too large",
-		HTTPStatus: http.StatusRequestEntityTooLarge,
-	})
+	response.Error(c, errs.NewPayloadTooLarge("request body too large"))
 	c.Abort()
 }

@@ -39,7 +39,7 @@ func Recovery() gin.HandlerFunc {
 				"path", c.Request.URL.Path,
 				"stack", string(debug.Stack()),
 			)
-			response.Error(c, errs.NewInfrastructure("internal server error"))
+			response.Error(c, errs.NewInfrastructure(msgInternalServer))
 			c.Abort()
 		}()
 		c.Next()
