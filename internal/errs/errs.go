@@ -55,8 +55,10 @@ func NewServiceUnavailable(service string) *AppError {
 	return &AppError{Code: CodeUnavailable, Message: service + " unavailable", HTTPStatus: 503}
 }
 
+// NewExternal marks an upstream that rejected our request (e.g. a 4xx). The
+// upstream is healthy, so this neither retries nor trips the breaker.
 func NewExternal(msg string) *AppError {
-	return &AppError{Code: CodeExternal, Message: msg, HTTPStatus: 502, trips: true}
+	return &AppError{Code: CodeExternal, Message: msg, HTTPStatus: 502}
 }
 
 func NewTransient(msg string) *AppError {
