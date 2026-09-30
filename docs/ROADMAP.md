@@ -318,6 +318,34 @@ tune blind; find the cliff, fix that bottleneck, then resume the 10× climb.
 
 Install: k6 binary (`brew`/`apt`/release). Not a Go dependency.
 
+### Cache hardening sub-ladder (rung 4→6, symptom-gated)
+
+Once cache-aside is on the hot read (rung 4), each hardening technique is
+**earned by first reproducing its failure in k6, then proving the fix**
+(before/after in the logbook). Never adopt them preemptively — an unproven
+hardening is just complexity.
+
+| Technique | Failure it fixes | Reproduce first | Rung |
+|---|---|---|---|
+| TTL jitter | avalanche — many keys expire at once ⇒ DB spike | warm N keys, identical TTL, watch synchronized-expiry spike | 4 |
+| `singleflight` | stampede — hot key expires, M misses ⇒ M duplicate DB reads | hammer one key, expire mid-load, count dup queries | 4 |
+| probabilistic early expiration (XFetch) | stampede tail — recompute before, not on, expiry | if p99 still spikes at the TTL boundary after `singleflight` | 4–5 |
+| bloom filter | penetration — lookups for non-existent keys skip cache ⇒ DB | flood random non-existent ids, watch ~100% miss → DB | 5 |
+| hot-key protection | one key saturates a single Valkey shard | rung 5–6 multi-node: one shard CPU-bound on one key | 5–6 |
+
+Order within rung 4: TTL jitter (free) → `singleflight` (hard stampede floor)
+→ XFetch (smooths the tail).
+
+### What is *not* on the RPS ladder
+
+**Outbound resilience** — `retry` / `breaker` / `registry` and the
+`httpclient` (pooled transport, per-call auth, error mapping, SSRF guard) —
+protects *outbound* calls only. An inbound read path with no upstream pays
+**zero** for it (see overhead budget: "Resilience — not per-request"). It is
+**consumer-driven**: wired back when a real upstream lands, not at any RPS
+rung. Rate-limit **throttle** is protective, not a throughput lever; it enters
+at rung 5 as edge hardening once a public LB exposes an abuse surface.
+
 ---
 
 ## Phase 0 — Infra & scaffolding  · size: S
@@ -582,22 +610,51 @@ asserts a span is exported to an in-test OTLP receiver.
 - `queue` sink real impl (Kafka/NATS + ClickHouse) — interface exists in Phase 7; build when Postgres audit saturates on the 100K path.
 - ~~GitHub Actions CI — after `git init` + remote.~~ Done: `.github/workflows/ci.yml` (build · vet · test · golangci-lint on push/PR). Integration-test job (Postgres + Valkey `services:`) added when the `integration` tag lands in Phase 3/4.
 
-## Sequencing & effort
+## Build order — earn the complexity (the ladder is the spine)
 
-| Phase | Depends on | Size | Parallelizable |
-|---|---|---|---|
-| 0 Infra | — | S | — |
-| 1 Foundations | 0 | M | critical path |
-| 2 HTTP edge | 1 | M | critical path |
-| 3 Postgres | 2 | L | parallel with 4 |
-| 4 Resilience | 2 | L | parallel with 3 |
-| 5 Outbound | 4 | M | after 4 |
-| 6 Lifecycle | 3, 4, 7, 8 | S | last (drains 7 + 8) |
-| 7 Async audit log | 2, 3 | M | parallel with 4/5 |
-| 8 Observability | 2 (app) · 0 (stack) | L | parallel with 3/4/5/7 |
+The phase sections above describe **how** each subsystem is built. They are
+**not** the build order. Build order follows the **RPS ladder**: a subsystem
+is built, wired onto the hot path, and proven at the rung its bottleneck
+appears — never before. The one hard prerequisite is the **benchmark harness
+first**, so every rung has a baseline to measure against.
 
-- Critical path: 0 → 1 → 2, then 3 ∥ 4 ∥ 7 ∥ 8, then 5, then 6 (6 drains 7 + flushes 8 on shutdown).
-- Ship each phase behind a real endpoint; do not port a subsystem no route exercises yet.
-- Each phase: code + integration test (real PG/Valkey) + ADR if it made a decision.
-- 100K RPS is infra work (replicas + LB + pgbouncer + read replicas + cache hit-rate) layered on this stateless base; Phase 7's async design keeps audit from being the one stateful bottleneck.
+### Restart note
+
+This mainline was recut from the pre-Valkey baseline (`7e9b706`, Phases 0–3).
+The earlier Phase 4–5 code (Valkey resilience, httpclient) is preserved in tag
+`phase5-built` and re-introduced **at its rung**, each time behind a k6 run
+that proves the failure first and the fix second. Done work is kept, not
+discarded — only its *entry point on the hot path* is re-sequenced.
+
+### Rung-ordered build order
+
+| Order | Rung | Build / wire | From phase | Status |
+|---|---|---|---|---|
+| 1 | 1 | Config, edge, Postgres CRUD on `items` | 0,1,2,3 | **done** (baseline) |
+| 2 | 1 | **Benchmark harness** (k6 smoke/load/stress/spike/soak) + per-layer timing + rung-1 logbook baseline | new | next |
+| 3 | 2 | Indexes — kill Seq Scans | — | |
+| 4 | 3 | Pool tuning, hot-query EXPLAIN | — | |
+| 5 | 4 | **Cache-aside** (Valkey cache from `phase5-built`) on the hot read | 4 | |
+| 6 | 4→6 | **Cache hardening** — TTL jitter → singleflight → XFetch → bloom → hot-key (each symptom-gated) | new | |
+| 7 | 5 | **Observability** (OTel → Tempo/Prometheus/Loki/Grafana) — single binary goes blind here | 8 | |
+| 8 | 5 | **Rate-limit throttle** (edge hardening) — bounded per-IP map (fixes memory-leak) | 4 | |
+| 9 | 5 | **Async audit log** — proven off-path via the ON/OFF matrix | 7 | |
+| 10 | 5 | **Lifecycle** — health/readiness + graceful shutdown (drains audit + telemetry) | 6 | |
+| 11 | 5 | Cloud: replicas + LB + PgBouncer → 10K rps | — | |
+| 12 | 6 | Shard/partition + CDN + audit `queue` sink → 100K rps | — | |
+| — | n/a | **Outbound resilience** (breaker/retry/registry + httpclient) | 5 | consumer-driven, off-ladder |
+
+### Rules
+
+- **Harness before infra.** No subsystem is wired onto the hot path until a
+  rung-1 baseline exists in `docs/benchmark-logbook.md`.
+- **No hot-path wiring without a proof.** Each cache/hardening/observability
+  addition ships with a k6 before/after showing the failure and the cure.
+- Ship each addition behind a real endpoint; do not wire a subsystem no route
+  exercises yet.
+- Each rung: code + integration test (real PG/Valkey) + logbook row + ADR if
+  it made a decision.
+- 100K RPS is infra work (replicas + LB + pgbouncer + read replicas + cache
+  hit-rate) layered on this stateless base; the audit log's async design keeps
+  it from becoming the one stateful bottleneck.
 ```

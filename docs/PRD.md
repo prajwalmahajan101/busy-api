@@ -48,9 +48,18 @@ demands, with hard numbers at every stage.
 > **database** and the **connection/network layer**. "Scaling the API" is 80%
 > about how we talk to the DB and how we cache, not about the language.
 
-Corollary: **earn the complexity.** Add each layer (cache, replica, PgBouncer,
-sharding, observability) exactly at the rung it becomes the only way forward —
-never before.
+Corollary: **earn the complexity.** Build, wire, and prove each layer (cache,
+replica, PgBouncer, sharding, observability) exactly at the rung its bottleneck
+appears — never before. "Built" is not "earned": a subsystem that exists but is
+not on the hot path with a benchmark proving it belongs there is debt, not
+progress. The one thing built *first* is the benchmark harness, because every
+rung needs a baseline to measure against.
+
+**Restart note (2026-09-30):** the earlier build ran ahead of this rule —
+Valkey resilience and the outbound httpclient were built before any load test
+existed. Mainline was recut from the pre-Valkey baseline (`7e9b706`); that code
+is preserved in tag `phase5-built` and re-introduced at its rung, each behind a
+k6 run that proves the failure first and the fix second.
 
 ---
 
@@ -116,6 +125,30 @@ Each rung: what breaks first, the fix, the p95 target for a DB-backed read.
 
 Latency is *allowed* to rise with load — success = staying **under the p95
 budget** (per global backend defaults: p95 < 200ms for user-facing endpoints).
+
+### Cache hardening sub-ladder (rung 4→6, symptom-gated)
+
+Once cache-aside is on the hot read (rung 4), each hardening technique is
+earned by **reproducing its failure in k6 first, then proving the fix** —
+before/after in the logbook. Never adopt preemptively.
+
+| Technique | Failure it fixes | Rung |
+|---|---|---|
+| TTL jitter | avalanche — synchronized key expiry ⇒ DB spike | 4 |
+| `singleflight` | stampede — hot key expiry ⇒ M duplicate DB reads | 4 |
+| probabilistic early expiration (XFetch) | stampede tail at the TTL boundary | 4–5 |
+| bloom filter | penetration — non-existent-key lookups skip cache ⇒ DB | 5 |
+| hot-key protection | one key saturates a single cache shard | 5–6 |
+
+Order within rung 4: TTL jitter → `singleflight` → XFetch.
+
+### Not on the RPS ladder — outbound resilience
+
+Circuit breaker, retry, and the outbound httpclient (auth, error mapping, SSRF
+guard) protect **outbound** calls only. An inbound read path with no upstream
+pays zero for them. They are **consumer-driven** — wired when a real upstream
+lands, at no particular rung. Rate-limit throttle is protective, not a
+throughput lever; it enters at rung 5 as edge hardening.
 
 ---
 
