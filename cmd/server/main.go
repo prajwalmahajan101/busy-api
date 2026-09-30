@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 
 	"github.com/gin-gonic/gin"
@@ -18,8 +19,11 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/response"
 )
 
-// msgResourceNotFound is the body for the temporary error route.
-const msgResourceNotFound = "resource not found"
+// Response bodies for the temporary infra routes.
+const (
+	msgPong             = "pong"
+	msgResourceNotFound = "resource not found"
+)
 
 func main() {
 	logger := logging.Setup()
@@ -72,7 +76,7 @@ func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) *g
 // now, domain routes on the root engine.
 func registerRoutes(r *gin.Engine, pool *pgxpool.Pool) {
 	r.GET("/ping", func(c *gin.Context) {
-		response.Success(c, 200, "pong", nil)
+		response.Success(c, http.StatusOK, msgPong, nil)
 	})
 
 	// Temporary route proving the error envelope; drops once real routes land.

@@ -52,7 +52,7 @@ type createReq struct {
 func (h *Handler) create(c *gin.Context) {
 	var req createReq
 	if err := c.ShouldBindJSON(&req); err != nil {
-		response.Error(c, errs.NewValidation("invalid request body", nil))
+		response.Error(c, errs.NewValidation(msgInvalidBody, nil))
 		return
 	}
 	item, err := h.svc.Create(c.Request.Context(), req.Notes)
@@ -60,12 +60,12 @@ func (h *Handler) create(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.Success(c, http.StatusCreated, "item created", toDTO(item))
+	response.Success(c, http.StatusCreated, msgItemCreated, toDTO(item))
 }
 
 func (h *Handler) list(c *gin.Context) {
-	page := queryInt(c, "page", 1)
-	size := queryInt(c, "size", 20)
+	page := queryInt(c, qpPage, 1)
+	size := queryInt(c, qpSize, 20)
 
 	items, total, err := h.svc.List(c.Request.Context(), page, size)
 	if err != nil {
@@ -90,7 +90,7 @@ func (h *Handler) get(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.Success(c, http.StatusOK, "ok", toDTO(item))
+	response.Success(c, http.StatusOK, msgItemFetched, toDTO(item))
 }
 
 func (h *Handler) softDelete(c *gin.Context) {
@@ -103,7 +103,7 @@ func (h *Handler) softDelete(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.Success(c, http.StatusOK, "item soft deleted", nil)
+	response.Success(c, http.StatusOK, msgItemSoftDeleted, nil)
 }
 
 func (h *Handler) hardDelete(c *gin.Context) {
@@ -116,13 +116,13 @@ func (h *Handler) hardDelete(c *gin.Context) {
 		response.Error(c, err)
 		return
 	}
-	response.Success(c, http.StatusOK, "item deleted", nil)
+	response.Success(c, http.StatusOK, msgItemDeleted, nil)
 }
 
 func parseID(c *gin.Context) (int64, error) {
-	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	id, err := strconv.ParseInt(c.Param(ppID), 10, 64)
 	if err != nil || id < 1 {
-		return 0, errs.NewValidation("invalid id", nil)
+		return 0, errs.NewValidation(msgInvalidID, nil)
 	}
 	return id, nil
 }

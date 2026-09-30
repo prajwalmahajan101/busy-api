@@ -15,6 +15,7 @@ import (
 const (
 	msgRateLimitExceeded = "rate limit exceeded"
 	msgInternalServer    = "internal server error"
+	msgBodyTooLarge      = "request body too large"
 )
 
 // String keys owned by this package: the request-id header and the gin context

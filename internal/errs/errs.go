@@ -36,6 +36,9 @@ const (
 	CodeExternalTimeout = "external_timeout"
 )
 
+// msgUnavailableSuffix is appended to a service name in NewServiceUnavailable.
+const msgUnavailableSuffix = " unavailable"
+
 func NewValidation(msg string, details map[string]any) *AppError {
 	return &AppError{Code: CodeValidation, Message: msg, HTTPStatus: 422, Details: details}
 }
@@ -57,7 +60,7 @@ func NewInfrastructure(msg string) *AppError {
 }
 
 func NewServiceUnavailable(service string) *AppError {
-	return &AppError{Code: CodeUnavailable, Message: service + " unavailable", HTTPStatus: 503}
+	return &AppError{Code: CodeUnavailable, Message: service + msgUnavailableSuffix, HTTPStatus: 503}
 }
 
 // NewExternal marks an upstream that rejected our request (e.g. a 4xx). The
