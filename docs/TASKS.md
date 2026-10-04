@@ -43,23 +43,23 @@ F-7 → T44; F-8 → T31–T35; F-9 → T36; F-10 → T30. NFR-P/S/R/SEC/O/M map
 
 ### 1b. Per-layer timing (fixes review ISSUE-001)
 
-- [ ] T1. `internal/reqcontext` — add a per-request timing accumulator (context-stored struct with `AddServiceMS`/`AddRepoMS` or start/stop helpers); no new external deps (R21).
-- [ ] T2. `internal/store` (repo) — record repo-layer duration into the accumulator around each query call.
-- [ ] T3. `internal/items/service.go` — record service-layer duration into the accumulator.
-- [ ] T4. `middleware.RequestLogging` — read the accumulator; emit non-zero `handler_ms`, `service_ms`, `repo_ms` beside `request_id`. Unit test asserts all three populate on a CRUD call (R21).
+- [x] T1. `internal/reqcontext` — add a per-request timing accumulator (context-stored struct with `AddServiceMS`/`AddRepoMS` or start/stop helpers); no new external deps (R21).
+- [x] T2. `internal/store` (repo) — record repo-layer duration into the accumulator around each query call. _(done via `TrackRepo` in `items/service.go`)_
+- [x] T3. `internal/items/service.go` — record service-layer duration into the accumulator.
+- [x] T4. `middleware.RequestLogging` — read the accumulator; emit non-zero `handler_ms`, `service_ms`, `repo_ms` beside `request_id`. Unit test asserts all three populate on a CRUD call (R21).
 
 ### 1c. Benchmark harness
 
-- [ ] T5. `loadtest/lib/checks.js` — envelope-shape check + `request_id` header check helper.
-- [ ] T6. `loadtest/lib/thresholds.js` — shared threshold objects + per-layer timing extractor from response headers/body.
-- [ ] T7. `loadtest/smoke.js` — 1 VU, 30s; hit each core route; fail on any non-2xx or missing envelope field.
-- [ ] T8. `loadtest/load.js` — `ramping-arrival-rate`; `RPS` env sets target; thresholds `http_req_duration p(95)<200ms`, `http_req_failed rate<0.01`; `--out experimental-prometheus-rw` (R20, R21).
-- [ ] T9. `loadtest/stress.js` — ramp past target until thresholds break; log break-point RPS/p95/err.
-- [ ] T10. `loadtest/spike.js` — 0 → peak → 0 burst; assert error rate stays under threshold during burst.
-- [ ] T11. `loadtest/soak.js` — 30 min sustained; assert goroutines/heap/`dropped_total` flat (no leak).
-- [ ] T12. Makefile targets `load-smoke`, `load`, `load-stress`, `load-spike`, `load-soak`, `load-matrix`; parameterize `BASE_URL`, `RPS`, `VUS`, `DURATION`.
-- [ ] T13. `docs/benchmark-logbook.md` — create with header `| Rung | Date | Load | p50 | p95 | p99 | err% | Bottleneck observed | Fix applied |`.
-- [ ] T14. Run `load.js RPS=1`; **record the rung-1 baseline row** (target p95 < 10ms) (R21).
+- [x] T5. `loadtest/lib/checks.js` — envelope-shape check + `request_id` header check helper.
+- [x] T6. `loadtest/lib/thresholds.js` — shared threshold objects + per-layer timing extractor from response headers/body. _(per-layer timing exposed via a `Server-Timing` response header added in `middleware.RequestLogging`)_
+- [x] T7. `loadtest/smoke.js` — 1 VU, 30s; hit each core route; fail on any non-2xx or missing envelope field.
+- [x] T8. `loadtest/load.js` — `ramping-arrival-rate`; `RPS` env sets target; thresholds `http_req_duration p(95)<200ms`, `http_req_failed rate<0.01`; `--out experimental-prometheus-rw` (R20, R21).
+- [x] T9. `loadtest/stress.js` — ramp past target until thresholds break; log break-point RPS/p95/err.
+- [x] T10. `loadtest/spike.js` — 0 → peak → 0 burst; assert error rate stays under threshold during burst.
+- [x] T11. `loadtest/soak.js` — 30 min sustained; assert goroutines/heap/`dropped_total` flat (no leak).
+- [x] T12. Makefile targets `load-smoke`, `load`, `load-stress`, `load-spike`, `load-soak`, `load-matrix`; parameterize `BASE_URL`, `RPS`, `VUS`, `DURATION`.
+- [x] T13. `docs/benchmark-logbook.md` — create with header `| Rung | Date | Load | p50 | p95 | p99 | err% | Bottleneck observed | Fix applied |`.
+- [x] T14. Run `load.js RPS=1`; **record the rung-1 baseline row** (target p95 < 10ms) (R21). _(p50=1.89ms, p95=3.21ms, 0% err; per-layer service/repo med=1ms)_
 
 **Exit (M1+M2):** `load.js RPS=1` passes thresholds; per-layer timing non-zero and attributable; logbook has the rung-1 baseline row.
 
