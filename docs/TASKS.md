@@ -76,8 +76,8 @@ F-7 → T44; F-8 → T31–T35; F-9 → T36; F-10 → T30. NFR-P/S/R/SEC/O/M map
 
 ## Rung 3 — Pool tuning (100 rps) · _M3_
 
-- [ ] T17. Run `load.js RPS=100`; measure pgxpool wait time; tune `DB_MAX_CONNS` (start `4×NumCPU`); `EXPLAIN ANALYZE` remaining hot queries; add any missing index; confirm p95 < 30ms; record (R22).
-- [ ] T18. `docs/local-tuning.md` — `ulimit -n 65535`, ephemeral-port range, two-machine k6 guidance for clean runs above ~5K rps (R23).
+- [x] T17. Run `load.js RPS=100`; measure pgxpool wait time; tune `DB_MAX_CONNS` (start `4×NumCPU`); `EXPLAIN ANALYZE` remaining hot queries; add any missing index; confirm p95 < 30ms; record (R22). _(p95=2.73ms; pool uncontended — repo p95 flat 1ms vs rung 2; no tuning/index earned)_
+- [x] T18. `docs/local-tuning.md` — `ulimit -n 65535`, ephemeral-port range, two-machine k6 guidance for clean runs above ~5K rps (R23).
 
 **Exit (M3):** p95 < 30ms @ 100 rps, < 1% errors; logbook rows for rungs 2, 3.
 
