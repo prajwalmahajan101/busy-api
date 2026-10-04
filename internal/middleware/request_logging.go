@@ -8,35 +8,28 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 )
 
-// RequestLogging writes one structured access-log line after the handler
-// returns, carrying per-layer timings and the request id from reqcontext.
+// RequestLogging seeds a per-layer timing accumulator into the request context,
+// then writes one structured access-log line after the handler returns, carrying
+// handler/service/repo timings and the request id from reqcontext.
 func RequestLogging(logger *slog.Logger) gin.HandlerFunc {
 	return func(c *gin.Context) {
+		ctx := reqcontext.WithTiming(c.Request.Context())
+		c.Request = c.Request.WithContext(ctx)
+
 		start := time.Now()
 		c.Next()
 		handlerMS := time.Since(start).Milliseconds()
 
-		ctx := c.Request.Context()
+		serviceMS, repoMS := reqcontext.TimingFromContext(ctx)
 		logger.Info("request",
 			"method", c.Request.Method,
 			"path", c.Request.URL.Path,
 			"status", c.Writer.Status(),
 			"handler_ms", handlerMS,
-			"service_ms", c.GetInt64(ctxServiceMS),
-			"repo_ms", c.GetInt64(ctxRepoMS),
+			"service_ms", serviceMS,
+			"repo_ms", repoMS,
 			"request_id", reqcontext.RequestIDFromContext(ctx),
 			"client_ip", c.ClientIP(),
 		)
 	}
-}
-
-// AddServiceTime accumulates service-layer duration for the current request,
-// surfaced as service_ms in the access log.
-func AddServiceTime(c *gin.Context, d time.Duration) {
-	c.Set(ctxServiceMS, c.GetInt64(ctxServiceMS)+d.Milliseconds())
-}
-
-// AddRepoTime accumulates repository-layer duration, surfaced as repo_ms.
-func AddRepoTime(c *gin.Context, d time.Duration) {
-	c.Set(ctxRepoMS, c.GetInt64(ctxRepoMS)+d.Milliseconds())
 }

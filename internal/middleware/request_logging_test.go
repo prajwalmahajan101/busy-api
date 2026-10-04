@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -23,8 +24,10 @@ func TestRequestLoggingEmitsFields(t *testing.T) {
 	r.Use(RequestID())
 	r.Use(RequestLogging(logger))
 	r.GET("/", func(c *gin.Context) {
-		AddServiceTime(c, 5*time.Millisecond)
-		AddRepoTime(c, 2*time.Millisecond)
+		// RequestLogging has seeded the reqcontext timing accumulator onto the
+		// request context; record into it the way the service/repo layers do.
+		reqcontext.AddServiceTime(c.Request.Context(), 5*time.Millisecond)
+		reqcontext.AddRepoTime(c.Request.Context(), 2*time.Millisecond)
 		c.Status(http.StatusOK)
 	})
 
