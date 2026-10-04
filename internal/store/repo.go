@@ -7,7 +7,34 @@ import (
 	"context"
 	"fmt"
 	"math"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// RowQuerier is the subset of a pgx pool/conn needed for a single-row read.
+// *pgxpool.Pool satisfies it.
+type RowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// CountItemsEstimate returns the approximate live row count of a table from
+// planner statistics (reltuples) in O(1), avoiding a full count(*) Seq Scan on
+// the list hot path. reltuples is a whole-table estimate maintained by
+// ANALYZE/autovacuum and ignores row-level filters (e.g. is_active); it is
+// accurate while soft-deletes are a small fraction of the table.
+// ponytail: swap to a maintained counter (trigger/outbox) or a cached exact
+// count only if exact list totals become a hard requirement.
+func CountItemsEstimate(ctx context.Context, q RowQuerier, relname string) (int64, error) {
+	var n int64
+	err := q.QueryRow(ctx,
+		`SELECT GREATEST(reltuples, 0)::bigint FROM pg_class WHERE relname = $1`,
+		relname,
+	).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("store: estimate count: %w", err)
+	}
+	return n, nil
+}
 
 // MaxPageSize caps a single page so a huge size can't overflow the int32
 // limit/offset the generated queries take. Handlers may cap lower (task 26).

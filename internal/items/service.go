@@ -92,8 +92,13 @@ func (s *Service) List(ctx context.Context, page, size int) ([]storedb.Item, int
 	listFn := func(ctx context.Context, limit, offest int32) ([]storedb.Item, error) {
 		return s.q.ListItems(ctx, storedb.ListItemsParams{Limit: limit, Offset: offest})
 	}
+	// Approximate total from planner stats (O(1)) — exact count(*) Seq-Scans the
+	// whole table and no index fixes it. See store.CountItemsEstimate.
+	countFn := func(ctx context.Context) (int64, error) {
+		return store.CountItemsEstimate(ctx, s.pool, "items")
+	}
 	stopRepo := reqcontext.TrackRepo(ctx)
-	items, total, err := store.ListPaginated(ctx, s.q.CountItems, listFn, page, size)
+	items, total, err := store.ListPaginated(ctx, countFn, listFn, page, size)
 	stopRepo()
 	if err != nil {
 		return nil, 0, errs.NewInfrastructure(msgListFailed)
