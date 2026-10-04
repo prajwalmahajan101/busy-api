@@ -25,6 +25,7 @@ BASE_URL  ?= http://localhost:8000
 RPS       ?= 100
 VUS       ?= 10
 DURATION  ?= 30s
+N         ?= 100000
 
 # Migrations
 MIGRATIONS_DIR := migrations
@@ -42,7 +43,7 @@ DB_DRIVER      := postgres
         dev \
         compose-up compose-down \
         obs-up obs-down \
-        load-smoke load load-stress load-spike load-soak load-matrix
+        load-smoke load load-stress load-spike load-soak load-matrix load-seed
 
 # ---------------------------------------------------------------------------
 # Default target
@@ -149,6 +150,11 @@ obs-down: ## Stop and remove the observability stack
 # ---------------------------------------------------------------------------
 # Load tests (k6) — targets used by the benchmark matrix
 # ---------------------------------------------------------------------------
+
+load-seed: ## Seed the items table with N rows (default 100000) for load tests
+	@test -n "$(DATABASE_URL)" || \
+		(echo "ERROR: DATABASE_URL is not set"; exit 1)
+	psql "$(DATABASE_URL)" -v n=$(N) -f loadtest/seed.sql
 
 load-smoke: ## Run smoke test (1 VU, 30 s) against BASE_URL
 	k6 run loadtest/smoke.js -e BASE_URL=$(BASE_URL)
