@@ -27,9 +27,6 @@ const (
 	// result; RateLimitHeaders reads it. Keeping the key here decouples
 	// RateLimitHeaders from the throttle package.
 	ctxRateLimit = "rate_limit_result"
-	// ctxServiceMS / ctxRepoMS accumulate per-layer timing for the access log.
-	ctxServiceMS = "timing_service_ms"
-	ctxRepoMS    = "timing_repo_ms"
 )
 
 // Setup installs the global middleware chain onto r in required order: Recovery
