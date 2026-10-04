@@ -67,8 +67,8 @@ F-7 → T44; F-8 → T31–T35; F-9 → T36; F-10 → T30. NFR-P/S/R/SEC/O/M map
 
 ## Rung 2 — Indexes (10 rps) · _M3 (partial)_
 
-- [ ] T15. Run `load.js RPS=10`; `EXPLAIN ANALYZE` the hot read; capture the plan.
-- [ ] T16. Add a goose migration for any missing index on a filtered/joined column showing a Seq Scan; re-run identical script; record before/after. p95 < 15ms (R22, F-3).
+- [x] T15. Run `load.js RPS=10`; `EXPLAIN ANALYZE` the hot read; capture the plan. _(GetItem/ListItems already index-backed; only Seq Scan was the exact count(*))_
+- [x] T16. Add a goose migration for any missing index on a filtered/joined column showing a Seq Scan; re-run identical script; record before/after. p95 < 15ms (R22, F-3). _(no index fixes the count-all Seq Scan → fix was `reltuples` approximate count + partial `idx_items_active_id`; p95 20.68ms→3.00ms)_
 
 **Exit:** no Seq Scan on the hot path; p95 < 15ms @ 10 rps; logbook row.
 
