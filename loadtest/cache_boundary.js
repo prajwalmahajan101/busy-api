@@ -3,63 +3,75 @@ import exec from "k6/execution";
 import { envelopeOK } from "./lib/checks.js";
 import { baseThresholds } from "./lib/thresholds.js";
 
-// Rung 4c — T27 go/no-go (XFetch). XFetch (probabilistic early recompute) only
-// earns its place IF, after singleflight (T26), p99 still SPIKES at the TTL
-// boundary — i.e. the one leader + the followers waiting on it in singleflight.Do
-// pay a visible latency penalty when a hot key expires. If the boundary p99 is
-// flat vs steady-state, XFetch is not earned (enforcement rule) and T27 is skipped.
+// Rung 4c — T27 gate (XFetch, re-gated on DB read count).
 //
-// Single hot key, jitter OFF (CACHE_TTL_JITTER_PCT=0 so expiry lands on a clean
-// TTL cadence), DB_MAX_CONNS=1 (worst case — the leader's cold read is the slowest
-// it can be). Each request is tagged `boundary` when it lands within ±GUARD_S of
-// an expiry instant (elapsed mod TTL), else `steady`. Compare p99{boundary} vs
-// p99{steady}: a spike at the boundary = XFetch earned; flat = skip T27.
+// Measures the TTL-boundary DB-read spike that jitter (T24) + singleflight (T26)
+// leave on the table — the residual that XFetch would fix.
 //
-//   CACHE_ITEM_TTL_S=10 CACHE_TTL_JITTER_PCT=0 CACHE_L1_ENABLED=false DB_MAX_CONNS=1 ./bin/server
-//   k6 run loadtest/cache_boundary.js -e RPS=3000 -e VUS=400 -e ITEM_TTL_S=10
+// How it differs from the old cache_boundary.js:
+//   OLD: single hot key + latency gate → singleflight collapses to 1 read, latency
+//        flat, "not earned." Wrong gate — every 4c failure is a DB-work problem.
+//   NEW: multi-key (like the avalanche scenario) + idx_scan poller (like the
+//        stampede/penetration proofs). All shipping defences ON (jitter + singleflight),
+//        L1 off (else L1 hides the L2 expiry from the DB).
+//
+// After T24 jitter, 1000 keys warmed in a burst expire across a ±jitter window
+// (~4s at ±10% of 20s TTL). Singleflight collapses each key's concurrent misses to
+// 1 DB read. Result: ~1000 DB reads in ~4-6s = a ~167-250/s spike over a 0/s
+// baseline. This IS the failure XFetch addresses: it probabilistically spreads
+// refreshes pre-expiry so they never cluster.
+//
+// MEASUREMENT: Postgres `pg_stat_user_tables.idx_scan` on `items` (same instrument
+// as T25/T26/T28 — measure the DB, not the cache). Polled per second by the make
+// target. Before the fix: a visible spike at the boundary. After (XFetch on): reads
+// spread across the TTL window, spike flattens.
+//
+// Run the API with shipping defaults EXCEPT L1 off:
+//   CACHE_ITEM_TTL_S=20 CACHE_TTL_JITTER_PCT=10 CACHE_L1_ENABLED=false DB_MAX_CONNS=1
+//
+//   make load-cache-boundary RPS=500 KEYS=1000 ITEM_TTL_S=20
 const BASE = __ENV.BASE_URL || "http://localhost:8000";
-const RPS = Number(__ENV.RPS || 3000);
-const VUS = Number(__ENV.VUS || 400);
-const DURATION_S = Number(__ENV.DURATION_S || 60);
-const HOT_ID = Number(__ENV.HOT_ID || 2);
-const ITEM_TTL_S = Number(__ENV.ITEM_TTL_S || 10);
-const GUARD_S = Number(__ENV.GUARD_S || 0.7);
+const RPS = Number(__ENV.RPS || 500);
+const VUS = Number(__ENV.VUS || 200);
+const KEYS = Number(__ENV.KEYS || 1000);
+const ITEM_TTL_S = Number(__ENV.ITEM_TTL_S || 20);
+const WARM_S = Number(__ENV.WARM_S || 3);
 
 export const options = {
   scenarios: {
-    hot: {
+    warm: {
+      executor: "shared-iterations",
+      iterations: KEYS,
+      vus: Math.min(VUS, KEYS),
+      maxDuration: `${WARM_S}s`,
+      startTime: "0s",
+      exec: "warmKey",
+    },
+    read: {
       executor: "constant-arrival-rate",
       rate: RPS,
       timeUnit: "1s",
-      duration: `${DURATION_S}s`,
+      startTime: `${WARM_S}s`,
+      duration: `${ITEM_TTL_S * 2}s`,
       preAllocatedVUs: VUS,
       maxVUs: VUS,
+      exec: "readKey",
     },
   },
-  // The whole question: is p99 at the expiry boundary worse than steady-state?
-  thresholds: {
-    ...baseThresholds,
-    "http_req_duration{phase:boundary}": ["p(99)<50"],
-    "http_req_duration{phase:steady}": ["p(99)<50"],
-  },
-  summaryTrendStats: ["avg", "med", "p(90)", "p(95)", "p(99)", "p(99.9)", "max"],
+  thresholds: { ...baseThresholds },
+  summaryTrendStats: ["avg", "min", "med", "p(90)", "p(95)", "p(99)", "max"],
 };
 
-// The hot key is (re)cached at ~0 and every ITEM_TTL_S after, so an expiry instant
-// sits at each multiple of ITEM_TTL_S on the shared clock. A request is "boundary"
-// if it lands within ±GUARD_S of one (where a cold recompute + follower-wait would
-// show up), else "steady".
-function phase() {
-  const elapsed = exec.instance.currentTestRunDuration / 1000;
-  // Skip the first full cycle: t=0 is k6 ramp-up + cold connections + the first
-  // cache fill, NOT a TTL expiry — tagging it "boundary" (elapsed%TTL≈0) poisons
-  // the bucket with startup latency. Real expiries land at every ITEM_TTL_S after.
-  if (elapsed < ITEM_TTL_S) return "warmup";
-  const m = elapsed % ITEM_TTL_S;
-  return m <= GUARD_S || m >= ITEM_TTL_S - GUARD_S ? "boundary" : "steady";
+function randomID() {
+  return 2 + Math.floor(Math.random() * KEYS);
 }
 
-export default function () {
-  const res = http.get(`${BASE}/items/${HOT_ID}`, { tags: { phase: phase() } });
+export function warmKey() {
+  const id = 2 + exec.scenario.iterationInInstance;
+  http.get(`${BASE}/items/${id}`, { tags: { phase: "warm" } });
+}
+
+export function readKey() {
+  const res = http.get(`${BASE}/items/${randomID()}`, { tags: { phase: "read" } });
   envelopeOK(res);
 }
