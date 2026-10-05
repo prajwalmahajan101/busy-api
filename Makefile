@@ -43,7 +43,7 @@ DB_DRIVER      := postgres
         dev \
         compose-up compose-down \
         obs-up obs-down \
-        load-smoke load load-stress load-spike load-soak load-matrix load-seed
+        load-smoke load load-stress load-spike load-soak load-matrix load-seed load-cache
 
 # ---------------------------------------------------------------------------
 # Default target
@@ -155,6 +155,13 @@ load-seed: ## Seed the items table with N rows (default 100000) for load tests
 	@test -n "$(DATABASE_URL)" || \
 		(echo "ERROR: DATABASE_URL is not set"; exit 1)
 	psql "$(DATABASE_URL)" -v n=$(N) -f loadtest/seed.sql
+
+load-cache: ## Rung-4 cache-aside hot-read proof (GET /items/:id over KEYS working set)
+	k6 run loadtest/cache_read.js \
+		-e BASE_URL=$(BASE_URL) \
+		-e RPS=$(RPS) \
+		-e VUS=$(VUS) \
+		-e DURATION=$(DURATION)
 
 load-smoke: ## Run smoke test (1 VU, 30 s) against BASE_URL
 	k6 run loadtest/smoke.js -e BASE_URL=$(BASE_URL)
