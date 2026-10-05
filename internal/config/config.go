@@ -77,6 +77,26 @@ type Config struct {
 	// seconds (self-heal when Valkey returns).
 	CacheBreakerRecoveryS int `env:"CACHE_BREAKER_RECOVERY_S" envDefault:"10"`
 
+	// CacheBloomEnabled fronts the hot read with an in-process bloom filter of
+	// existing item ids. A flood of absent ids (cache penetration, T28) is answered
+	// in-process — "this id cannot exist" short-circuits to 404 before any DB touch,
+	// so the DB read rate stays flat instead of tracking attacker RPS 1:1.
+	CacheBloomEnabled bool `env:"CACHE_BLOOM_ENABLED" envDefault:"true"`
+
+	// CacheBloomCapacity sizes the bloom for the expected id count at the target
+	// false-positive rate. The table may grow past this; FP degrades gracefully
+	// (a false positive just falls through to the DB, which answers correctly).
+	CacheBloomCapacity int `env:"CACHE_BLOOM_CAPACITY" envDefault:"1000000"`
+
+	// CacheBloomFPRate is the bloom's target false-positive probability.
+	CacheBloomFPRate float64 `env:"CACHE_BLOOM_FP_RATE" envDefault:"0.01"`
+
+	// CacheNegTTLS is the negative-cache (tombstone) TTL in seconds: how long a
+	// confirmed-absent id is remembered so a repeated bad id (one that passed the
+	// bloom as a false positive) does not re-hit the DB. Kept short.
+	CacheNegTTLS int `env:"CACHE_NEG_TTL_S" envDefault:"30"`
+
+
 	// -------------------------------------------------------------------------
 	// Logging
 	// -------------------------------------------------------------------------

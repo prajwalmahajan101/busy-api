@@ -71,7 +71,18 @@ func run(logger *slog.Logger) error {
 		TTLJitterPct:         cfg.CacheTTLJitterPct,
 	})
 
-	r := buildRouter(cfg, logger, pool, itemCache)
+	// Bloom pre-filter of existing ids (cache penetration, T28). Built once at
+	// boot from the items table; nil when disabled, which keeps the Get path's
+	// short-circuit a no-op.
+	var presence *items.Presence
+	if cfg.CacheBloomEnabled {
+		presence, err = items.NewPresence(context.Background(), pool, cfg.CacheBloomCapacity, cfg.CacheBloomFPRate)
+		if err != nil {
+			return fmt.Errorf("presence init: %w", err)
+		}
+	}
+
+	r := buildRouter(cfg, logger, pool, itemCache, presence)
 	return r.Run(":" + cfg.Port)
 }
 
@@ -88,16 +99,16 @@ func initDB(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 // documented order via middleware.Setup, then registers every route. No
 // business logic lives here. The per-IP throttle group returns at rung 5 (T30),
 // when the resilience/throttle backend is re-introduced.
-func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, itemCache cache.Cache) *gin.Engine {
+func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, itemCache cache.Cache, presence *items.Presence) *gin.Engine {
 	r := gin.New()
 	middleware.Setup(r, cfg, logger)
-	registerRoutes(r, pool, itemCache, time.Duration(cfg.CacheItemTTLS)*time.Second)
+	registerRoutes(r, pool, itemCache, time.Duration(cfg.CacheItemTTLS)*time.Second, time.Duration(cfg.CacheNegTTLS)*time.Second, presence)
 	return r
 }
 
 // registerRoutes is the single home for every HTTP route: infra routes and, for
 // now, domain routes on the root engine.
-func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, itemCache cache.Cache, cacheTTL time.Duration) {
+func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, itemCache cache.Cache, cacheTTL, negTTL time.Duration, presence *items.Presence) {
 	r.GET("/ping", func(c *gin.Context) {
 		response.Success(c, http.StatusOK, msgPong, nil)
 	})
@@ -107,5 +118,5 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, itemCache cache.Cache, ca
 		response.Error(c, errs.NewNotFound(msgResourceNotFound))
 	})
 
-	items.NewHandler(items.NewService(pool, itemCache, cacheTTL)).RegisterRoutes(r)
+	items.NewHandler(items.NewService(pool, itemCache, cacheTTL, negTTL, presence)).RegisterRoutes(r)
 }

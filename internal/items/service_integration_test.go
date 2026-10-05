@@ -66,7 +66,7 @@ func countItems(t *testing.T, pool *pgxpool.Pool) int64 {
 
 func TestItemsCRUD_Integration(t *testing.T) {
 	pool := setupPool(t)
-	svc := NewService(pool, memCache(), time.Minute)
+	svc := NewService(pool, memCache(), time.Minute, time.Minute, nil)
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
@@ -124,7 +124,7 @@ func TestCacheFailOpen_Integration(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed one row (via an in-memory-cached service, unrelated to the assertion).
-	created, err := NewService(pool, memCache(), time.Minute).Create(ctx, []byte(`{"k":1}`))
+	created, err := NewService(pool, memCache(), time.Minute, time.Minute, nil).Create(ctx, []byte(`{"k":1}`))
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestCacheFailOpen_Integration(t *testing.T) {
 		DialTimeout: 200 * time.Millisecond,
 	})
 	t.Cleanup(func() { _ = down.Close() })
-	svc := NewService(pool, cache.NewProvider(down).Get("items"), time.Minute)
+	svc := NewService(pool, cache.NewProvider(down).Get("items"), time.Minute, time.Minute, nil)
 
 	got, err := svc.Get(ctx, created.ID)
 	if err != nil {
@@ -188,14 +188,14 @@ func TestSingleflight_CollapsesConcurrentMisses(t *testing.T) {
 	pool := setupPool(t)
 	ctx := context.Background()
 
-	created, err := NewService(pool, memCache(), time.Minute).Create(ctx, []byte(`{"hot":1}`))
+	created, err := NewService(pool, memCache(), time.Minute, time.Minute, nil).Create(ctx, []byte(`{"hot":1}`))
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
 
 	const n = 50
 	bc := newBarrierCache(n)
-	svc := NewService(pool, bc, time.Minute)
+	svc := NewService(pool, bc, time.Minute, time.Minute, nil)
 
 	var wg sync.WaitGroup
 	wg.Add(n)
@@ -214,6 +214,66 @@ func TestSingleflight_CollapsesConcurrentMisses(t *testing.T) {
 	bc.mu.Unlock()
 	if sets != 1 {
 		t.Fatalf("cache Set called %d times; want 1 — singleflight must collapse %d concurrent misses to one DB load", sets, n)
+	}
+}
+
+// Cache penetration (T28): the bloom pre-filter must 404 a definitely-absent id
+// without touching the DB, while never false-negatively 404ing a real item.
+func TestBloomShortCircuit_Integration(t *testing.T) {
+	pool := setupPool(t)
+	ctx := context.Background()
+
+	seed := NewService(pool, memCache(), time.Minute, time.Minute, nil)
+	real, err := seed.Create(ctx, []byte(`{"real":1}`))
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	presence, err := NewPresence(ctx, pool, 10000, 0.01)
+	if err != nil {
+		t.Fatalf("new presence: %v", err)
+	}
+	svc := NewService(pool, memCache(), time.Minute, time.Minute, presence)
+
+	// A real id must still resolve — the bloom has no false negatives.
+	if _, err := svc.Get(ctx, real.ID); err != nil {
+		t.Fatalf("real id %d short-circuited (false negative): %v", real.ID, err)
+	}
+
+	// An out-of-range absent id must 404 (bloom says definitely-absent).
+	if _, err := svc.Get(ctx, 1_000_000_000); err == nil {
+		t.Fatal("absent id resolved — penetration not blocked")
+	}
+}
+
+// Negative cache (T28): a confirmed-absent id (reached with the bloom disabled,
+// simulating a false positive that falls through) is tombstoned, so a repeat is
+// served from cache. We assert the tombstone lands in the cache after one miss.
+func TestNegativeCache_Integration(t *testing.T) {
+	pool := setupPool(t)
+	ctx := context.Background()
+
+	c := memCache()
+	// presence nil → bloom disabled, so the absent id reaches the DB once and the
+	// loader writes the tombstone (the false-positive path, forced deterministically).
+	svc := NewService(pool, c, time.Minute, time.Minute, nil)
+
+	const absent = int64(1_234_567)
+	if _, err := svc.Get(ctx, absent); err == nil {
+		t.Fatal("absent id resolved")
+	}
+
+	b, hit, _ := c.Get(ctx, itemCacheKey(absent))
+	if !hit {
+		t.Fatal("no tombstone written after a confirmed-absent read — repeats would re-hit the DB")
+	}
+	if string(b) != string(tombstone) {
+		t.Fatalf("cached value %q is not the tombstone — negative cache corrupted", b)
+	}
+
+	// A second read still 404s (served from the tombstone).
+	if _, err := svc.Get(ctx, absent); err == nil {
+		t.Fatal("second absent read resolved")
 	}
 }
 

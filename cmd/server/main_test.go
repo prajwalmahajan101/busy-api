@@ -56,5 +56,5 @@ func TestErrorTypedErrorEnvelope(t *testing.T) {
 func testRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{MaxBodyBytes: 1 << 20, Env: "local"}
-	return buildRouter(cfg, logging.Setup(), nil, cache.NewProvider(nil).Get("test"))
+	return buildRouter(cfg, logging.Setup(), nil, cache.NewProvider(nil).Get("test"), nil)
 }
