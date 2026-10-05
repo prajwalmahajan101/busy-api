@@ -106,8 +106,8 @@ scenario that reproduces the failure on the current code, (2) the fix, (3) a re-
 proving it, and (4) a before/after row in `docs/benchmark-logbook.md`. Numbers gate
 the merge — an unproven hardening is reverted, not kept.
 
-- [ ] T22a. **L1 in-memory tier (L1 memory → L2 Valkey → DB).** Wrap `cache.Cache` with a bounded in-process L1 (LRU + short TTL) in front of Valkey: read L1 → L2 → DB, populate both on the way back. k6 scenario — stop Valkey mid-load and prove the DB read rate stays **low** (L1 absorbs the working set) instead of flooding; before/after DB-load in logbook (F-6, NFR-R5). Bound L1 (`CACHE_L1_MAX`) so it cannot OOM.
-- [ ] T22b. **Self-healing Valkey breaker.** Wrap L2 (Valkey) ops in a circuit breaker (reuse `internal/resilience/breaker` from `phase5-built`): after `CACHE_BREAKER_FAIL_THRESHOLD` failures OPEN → **skip Valkey entirely** (no dial), serve L1/DB; HALF_OPEN probe every `CACHE_BREAKER_RECOVERY_S` to re-close when Valkey returns. k6 — Valkey down: prove the per-request dial tax disappears (p95 recovers vs naive fail-open) and that it auto-recovers when Valkey restarts (NFR-R5).
+- [x] T22a. **L1 in-memory tier (L1 memory → L2 Valkey → DB).** Wrap `cache.Cache` with a bounded in-process L1 (LRU + short TTL) in front of Valkey: read L1 → L2 → DB, populate both on the way back. k6 scenario — stop Valkey mid-load and prove the DB read rate stays **low** (L1 absorbs the working set) instead of flooding; before/after DB-load in logbook (F-6, NFR-R5). Bound L1 (`CACHE_L1_MAX`) so it cannot OOM. _(`cache.lruCache` via `hashicorp/golang-lru/v2/expirable`, tiered in `cache.NewTiered`; `loadtest/cache_resilience.js` proved outage db_reads 19,894 → 0)_
+- [x] T22b. **Self-healing Valkey breaker.** Wrap L2 (Valkey) ops in a circuit breaker (reuse `internal/resilience/breaker` from `phase5-built`): after `CACHE_BREAKER_FAIL_THRESHOLD` failures OPEN → **skip Valkey entirely** (no dial), serve L1/DB; HALF_OPEN probe every `CACHE_BREAKER_RECOVERY_S` to re-close when Valkey returns. k6 — Valkey down: prove the per-request dial tax disappears (p95 recovers vs naive fail-open) and that it auto-recovers when Valkey restarts (NFR-R5). _(in-memory `breaker.NewMemory` around `cache.breakerCache`; outage p95 268ms → 0.91ms, auto-recovered on restart; ADR 0007)_
 
 ### 4c. Cache hardening — one lesson per reproduced symptom
 
@@ -210,4 +210,4 @@ Each: k6 scenario proving the failure first, then the cure. Before/after in logb
 - [ ] `0004-error-envelope.md`
 - [ ] `0005-api-audit-log.md`
 - [ ] `0006-observability.md`
-- [ ] `0007-cache-hardening.md` — tiered L1→L2→DB + self-healing Valkey breaker, then TTL jitter / singleflight / XFetch / bloom / hot-key split, each earned by a reproduced failure.
+- [x] `0007-cache-hardening.md` — tiered L1→L2→DB + self-healing Valkey breaker (T22a/T22b landed); TTL jitter / singleflight / XFetch / bloom / hot-key split remain future rows, each earned by a reproduced failure.
