@@ -40,7 +40,7 @@ func (p *Provider) Get(name string) Cache {
 	}
 	var c Cache
 	if p.rdb != nil {
-		c = newValkeyCache(name, p.rdb)
+		c = FailOpen(newValkeyCache(name, p.rdb)) // valkey propagates errors; fail open here
 	} else {
 		c = newMemoryCache()
 	}

@@ -67,10 +67,11 @@ func TestValkeyCache_Integration(t *testing.T) {
 }
 
 func TestValkeyCache_FailOpen(t *testing.T) {
-	// Client to a dead address: every op must fail open, never return an error.
+	// Client to a dead address: the FailOpen decorator must degrade every op to a
+	// miss / no-op, never returning an error (the raw valkeyCache now propagates).
 	bad := redis.NewClient(&redis.Options{Addr: "127.0.0.1:1", DialTimeout: 200 * time.Millisecond})
 	t.Cleanup(func() { _ = bad.Close() })
-	c := newValkeyCache("x", bad)
+	c := FailOpen(newValkeyCache("x", bad))
 	ctx := context.Background()
 
 	if _, hit, err := c.Get(ctx, "k"); err != nil || hit {

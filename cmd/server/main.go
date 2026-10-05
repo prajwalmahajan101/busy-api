@@ -51,16 +51,24 @@ func run(logger *slog.Logger) error {
 	}
 	defer db.Close(pool)
 
-	// Cache-aside backend for the hot read. A nil Valkey client (VALKEY_URL
-	// empty or unreachable at build time) makes the provider hand out an
-	// in-memory cache; Valkey errors at runtime fail open as misses.
+	// Tiered cache-aside backend for the hot read: L1 (in-process LRU) → L2
+	// (Valkey, guarded by a self-healing breaker) → DB. A nil Valkey client
+	// (VALKEY_URL empty) falls back to an in-memory cache. A Valkey outage is
+	// absorbed by L1 (DB stays flat) and the breaker skips the dead backend
+	// (no dial tax), auto-recovering when Valkey returns.
 	valkey.Configure(cfg.ValkeyURL)
 	rdb, err := valkey.Client("cache")
 	if err != nil {
 		return fmt.Errorf("valkey client: %w", err)
 	}
 	defer func() { _ = valkey.Close() }()
-	itemCache := cache.NewProvider(rdb).Get("items")
+	itemCache := cache.NewTiered("items", rdb, cache.TierConfig{
+		L1Enabled:            cfg.CacheL1Enabled,
+		L1Max:                cfg.CacheL1Max,
+		L1TTL:                time.Duration(cfg.CacheL1TTLS) * time.Second,
+		BreakerFailThreshold: cfg.CacheBreakerFailThreshold,
+		BreakerRecovery:      time.Duration(cfg.CacheBreakerRecoveryS) * time.Second,
+	})
 
 	r := buildRouter(cfg, logger, pool, itemCache)
 	return r.Run(":" + cfg.Port)

@@ -55,6 +55,24 @@ type Config struct {
 	// CacheItemTTLS is the cache-aside TTL for single-item reads, in seconds.
 	CacheItemTTLS int `env:"CACHE_ITEM_TTL_S" envDefault:"300"`
 
+	// CacheL1Enabled fronts Valkey (L2) with a bounded in-process L1 tier
+	// (L1 → L2 → DB) so a Valkey outage does not flood the DB (NFR-R5).
+	CacheL1Enabled bool `env:"CACHE_L1_ENABLED" envDefault:"true"`
+
+	// CacheL1Max bounds L1 entries (LRU eviction) so it cannot OOM on an outage.
+	CacheL1Max int `env:"CACHE_L1_MAX" envDefault:"10000"`
+
+	// CacheL1TTLS is the short L1 TTL in seconds (L1 may serve slightly stale).
+	CacheL1TTLS int `env:"CACHE_L1_TTL_S" envDefault:"30"`
+
+	// CacheBreakerFailThreshold is the number of Valkey failures before the cache
+	// breaker OPENs (skips Valkey, no per-request dial tax).
+	CacheBreakerFailThreshold int `env:"CACHE_BREAKER_FAIL_THRESHOLD" envDefault:"5"`
+
+	// CacheBreakerRecoveryS is the cache breaker OPEN→HALF_OPEN probe interval in
+	// seconds (self-heal when Valkey returns).
+	CacheBreakerRecoveryS int `env:"CACHE_BREAKER_RECOVERY_S" envDefault:"10"`
+
 	// -------------------------------------------------------------------------
 	// Logging
 	// -------------------------------------------------------------------------
