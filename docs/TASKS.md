@@ -18,7 +18,7 @@ first and the fix second.
 | 1 | 1 rps | correct API (done) + benchmark harness + baseline | M1 + M2 |
 | 2 | 10 rps | indexes | M3 |
 | 3 | 100 rps | pool tuning | M3 |
-| 4 | 1K rps | cache-aside + cache hardening | M4 |
+| 4 | 1K rps | cache-aside + tiered L1/self-healing + cache hardening | M4 |
 | 5 | 10K rps | horizontal + observability + throttle + audit + lifecycle | M5 |
 | 6 | 100K rps | shard + CDN + audit queue sink | M6 |
 | — | n/a | outbound resilience (breaker/retry/httpclient) — consumer-driven | — |
@@ -27,8 +27,10 @@ Success at each rung = under its p95 budget, < 1% errors. If a 10× jump breaks,
 bisect with a half-decade rung (500, 2K, 5K, 50K) before tuning. Every rung
 records a before/after row in `docs/benchmark-logbook.md`.
 
-Requirement coverage: F-1/F-2/F-4/F-5 done at baseline; F-3 → T8; F-6 → T13–T14;
-F-7 → T44; F-8 → T31–T35; F-9 → T36; F-10 → T30. NFR-P/S/R/SEC/O/M mapped inline.
+Requirement coverage: F-1/F-2/F-4/F-5 done at baseline; F-3 → T16; F-6 → T19–T22
+(+ tiered L1 & self-healing → T22a/T22b); F-7 → T66; F-8 → T31–T39; F-9 → T51;
+F-10 → T30; F-11 (tiered cache) → T22a/T22b/T28a. NFR-P/S/R/SEC/O/M mapped inline;
+NFR-R5 (self-healing cache) → T22a/T22b.
 
 ---
 
@@ -87,24 +89,40 @@ F-7 → T44; F-8 → T31–T35; F-9 → T36; F-10 → T30. NFR-P/S/R/SEC/O/M map
 
 ### 4a. Cache-aside
 
-- [ ] T19. Cherry-pick / re-introduce `internal/valkey` client from `phase5-built`; verify `Ping` + empty-URL ⇒ in-memory fallback.
-- [ ] T20. Cherry-pick / re-introduce `internal/resilience/cache` (memory + Valkey, fail-open) from `phase5-built`; integration test: Valkey down ⇒ DB result, never 5xx (R6, F-6).
-- [ ] T21. Wire cache-aside into the hot read (`items` Get): Valkey → miss → Postgres → populate; invalidate on write/soft-delete.
-- [ ] T22. Run `load.js RPS=1000`; confirm p95 < 50ms; record bottleneck + fix (R6).
+- [x] T19. Cherry-pick / re-introduce `internal/valkey` client from `phase5-built`; verify `Ping` + empty-URL ⇒ in-memory fallback.
+- [x] T20. Cherry-pick / re-introduce `internal/resilience/cache` (memory + Valkey, fail-open) from `phase5-built`; integration test: Valkey down ⇒ DB result, never 5xx (R6, F-6). _(TestCacheFailOpen_Integration: cache wired to a dead Valkey port → Get served from Postgres, no error; also proven under load)_
+- [x] T21. Wire cache-aside into the hot read (`items` Get): Valkey → miss → Postgres → populate; invalidate on write/soft-delete.
+- [x] T22. Run `load.js RPS=1000`; confirm p95 < 50ms; record bottleneck + fix (R6). _(1K unconstrained needs no cache; earned the cache by simulating DB contention with `DB_MAX_CONNS=1` — cache off p95=278ms → on p95=4.6ms via `loadtest/cache_read.js`)_
 
-### 4b. Cache hardening — one lesson per reproduced symptom
+### 4b. Resilient tiered cache + self-healing (fixes the fail-open DB-flood + dial-tax)
 
-Each: k6 scenario proving the failure first, then the cure. Before/after in logbook. Order: TTL jitter → singleflight → XFetch.
+The rung-4a cache is single-tier Valkey with naive fail-open: when Valkey is down
+every read still **dials** the dead server (measured ~240ms per-request dial tax,
+`DB_MAX_CONNS=1` run) **and** every miss hits the DB — so an outage both slows and
+re-loads the DB. Fix with an L1 tier + a breaker around L2, each earned by a k6 run.
+
+**Enforcement rule (every task in 4b and 4c):** no change merges without (1) a k6
+scenario that reproduces the failure on the current code, (2) the fix, (3) a re-run
+proving it, and (4) a before/after row in `docs/benchmark-logbook.md`. Numbers gate
+the merge — an unproven hardening is reverted, not kept.
+
+- [ ] T22a. **L1 in-memory tier (L1 memory → L2 Valkey → DB).** Wrap `cache.Cache` with a bounded in-process L1 (LRU + short TTL) in front of Valkey: read L1 → L2 → DB, populate both on the way back. k6 scenario — stop Valkey mid-load and prove the DB read rate stays **low** (L1 absorbs the working set) instead of flooding; before/after DB-load in logbook (F-6, NFR-R5). Bound L1 (`CACHE_L1_MAX`) so it cannot OOM.
+- [ ] T22b. **Self-healing Valkey breaker.** Wrap L2 (Valkey) ops in a circuit breaker (reuse `internal/resilience/breaker` from `phase5-built`): after `CACHE_BREAKER_FAIL_THRESHOLD` failures OPEN → **skip Valkey entirely** (no dial), serve L1/DB; HALF_OPEN probe every `CACHE_BREAKER_RECOVERY_S` to re-close when Valkey returns. k6 — Valkey down: prove the per-request dial tax disappears (p95 recovers vs naive fail-open) and that it auto-recovers when Valkey restarts (NFR-R5).
+
+### 4c. Cache hardening — one lesson per reproduced symptom
+
+Each: k6 scenario proving the failure first, then the cure. Before/after in logbook. Order: TTL jitter → singleflight → XFetch → bloom → hot-key.
 
 - [ ] T23. **TTL jitter (avalanche):** k6 scenario — warm N keys, identical TTL, capture the synchronized-expiry DB spike.
-- [ ] T24. Fix avalanche — add ±jitter to every cache `Set` TTL; re-run; prove the spike flattens.
+- [ ] T24. Fix avalanche — add ±jitter to every cache `Set` TTL (L1 and L2); re-run; prove the spike flattens.
 - [ ] T25. **`singleflight` (stampede):** k6 scenario — hammer one hot key, expire it mid-load, count M duplicate DB reads.
 - [ ] T26. Fix stampede — collapse concurrent misses per key via `golang.org/x/sync/singleflight`; re-run; prove 1 DB query per expiry.
-- [ ] T27. **XFetch (early expiration):** only if p99 still spikes at the TTL boundary after T26 — recompute a hot value before expiry (age + β·log(rand)·delta); prove the boundary spike disappears.
+- [ ] T27. **XFetch (probabilistic early expiration):** only if p99 still spikes at the TTL boundary after T26 — recompute a hot value before expiry (age + β·log(rand)·delta); prove the boundary spike disappears.
 - [ ] T28. **Bloom filter (penetration):** k6 scenario — flood random non-existent ids, capture ~100% miss → DB; add a bloom filter of existing keys (Valkey `BF.*` or in-process) short-circuiting known-absent lookups; re-run; prove DB load stays flat.
+- [ ] T28a. **Hot-key protection (key-splitting + L1):** k6 scenario — hammer a single hot key so one Valkey connection/shard saturates; fan the key into `CACHE_HOTKEY_SPLITS` replica sub-keys (`item:<id>#<n>`, read a random replica) and let L1 (T22a) absorb; re-run; prove the single-key load spreads and tail flattens. Rung-6 T62 extends this to multi-shard. (moved earlier: L1 makes it reproducible on one box)
 - [ ] T29. Push local ramp toward 10K rps (k6 on second machine); record local ceiling + where CPU/port exhaustion appears; document as cloud-migration trigger (R23, R24).
 
-**Exit (M4):** p95 < 50ms @ 1K rps; cache fail-open verified; each hardening technique has a paired failure/cure logbook row; local ceiling documented.
+**Exit (M4):** p95 < 50ms @ 1K rps; cache fail-open verified; **L1 tier absorbs a Valkey outage (DB load stays flat) and the breaker self-heals on recovery**; each hardening technique (jitter / singleflight / XFetch / bloom / hot-key) has a paired failure/cure logbook row; local ceiling documented.
 
 ---
 
@@ -167,7 +185,7 @@ Each: k6 scenario proving the failure first, then the cure. Before/after in logb
 - [ ] T59. Evaluate distributed-DB choice from rung-5 access patterns (Citus / CockroachDB / read-replica fan-out + CDN edge); write `docs/adr/0007-rung6-db-strategy.md`.
 - [ ] T60. Implement the chosen DB strategy; validate with 20–50 replicas + LB.
 - [ ] T61. Implement the real `queue` sink (Kafka/NATS) and switch `APILOG_SINK=queue` so Postgres audit does not saturate at this scale (R8).
-- [ ] T62. **Hot-key protection** — L1 in-process cache / key-splitting if a single Valkey shard saturates on one key; reproduce the shard-hot-spot first, then prove the fix.
+- [ ] T62. **Hot-key protection at shard scale** — extends rung-4 T28a (L1 + key-splitting) to a real multi-shard Valkey: reproduce one shard CPU-bound on one key, then prove splitting + L1 spreads it across shards.
 - [ ] T63. Distributed k6 to 100K rps; confirm p95 < 200ms; record in logbook.
 
 **Exit (M6):** p95 < 200ms @ 100K rps; logbook complete; ADR 0007 written.
@@ -192,4 +210,4 @@ Each: k6 scenario proving the failure first, then the cure. Before/after in logb
 - [ ] `0004-error-envelope.md`
 - [ ] `0005-api-audit-log.md`
 - [ ] `0006-observability.md`
-- [ ] `0007-cache-hardening.md` — TTL jitter / singleflight / XFetch / bloom / hot-key, each earned by a reproduced failure.
+- [ ] `0007-cache-hardening.md` — tiered L1→L2→DB + self-healing Valkey breaker, then TTL jitter / singleflight / XFetch / bloom / hot-key split, each earned by a reproduced failure.

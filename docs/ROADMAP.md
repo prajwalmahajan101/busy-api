@@ -71,6 +71,14 @@ async and off the hot path (Phase 7).
 | `DB_CONN_TIMEOUT_MS` | no | `5000` | pgxpool connect timeout |
 | `DB_QUERY_TIMEOUT_MS` | no | `2000` | per-call query deadline (`context.WithTimeout` on every DB call) |
 | `VALKEY_URL` | no | `redis://localhost:6379/0` | resilience backend; empty ⇒ in-memory fallback |
+| `CACHE_ITEM_TTL_S` | no | `300` | cache-aside TTL for single-item reads (seconds) |
+| `CACHE_L1_ENABLED` | no | `true` | in-process L1 tier in front of Valkey (L1→L2→DB) |
+| `CACHE_L1_MAX` | no | `10000` | bounded L1 entry count (LRU evict) — cannot OOM on Valkey outage |
+| `CACHE_L1_TTL_S` | no | `30` | short L1 TTL (L1 can serve slightly stale on outage) |
+| `CACHE_BREAKER_FAIL_THRESHOLD` | no | `5` | Valkey failures before the cache breaker OPENs (skip Valkey, no dial tax) |
+| `CACHE_BREAKER_RECOVERY_S` | no | `10` | cache breaker OPEN→HALF_OPEN probe interval (self-heal) |
+| `CACHE_TTL_JITTER_PCT` | no | `10` | ±% jitter added to every cache Set TTL (avalanche fix) |
+| `CACHE_HOTKEY_SPLITS` | no | `1` | replica sub-keys per hot key (`>1` enables key-splitting) |
 | `LOG_LEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR |
 | `LOG_JSON` | no | `true` | false ⇒ text handler |
 | `LOG_FILE` | no | `` (stdout only) | path ⇒ rotate+gzip |
@@ -329,14 +337,18 @@ hardening is just complexity.
 
 | Technique | Failure it fixes | Reproduce first | Rung |
 |---|---|---|---|
+| L1 in-memory tier (L1→L2→DB) | Valkey outage ⇒ every miss floods the DB | stop Valkey mid-load, watch DB read-rate spike | 4 |
+| self-healing Valkey breaker | Valkey down ⇒ per-request dial tax (~240ms) | stop Valkey, watch p95 blow up on dial timeouts | 4 |
 | TTL jitter | avalanche — many keys expire at once ⇒ DB spike | warm N keys, identical TTL, watch synchronized-expiry spike | 4 |
 | `singleflight` | stampede — hot key expires, M misses ⇒ M duplicate DB reads | hammer one key, expire mid-load, count dup queries | 4 |
-| probabilistic early expiration (XFetch) | stampede tail — recompute before, not on, expiry | if p99 still spikes at the TTL boundary after `singleflight` | 4–5 |
-| bloom filter | penetration — lookups for non-existent keys skip cache ⇒ DB | flood random non-existent ids, watch ~100% miss → DB | 5 |
-| hot-key protection | one key saturates a single Valkey shard | rung 5–6 multi-node: one shard CPU-bound on one key | 5–6 |
+| probabilistic early expiration (XFetch) | stampede tail — recompute before, not on, expiry | if p99 still spikes at the TTL boundary after `singleflight` | 4 |
+| bloom filter | penetration — lookups for non-existent keys skip cache ⇒ DB | flood random non-existent ids, watch ~100% miss → DB | 4 |
+| hot-key protection (key-splitting + L1) | one key saturates a single Valkey connection/shard | hammer one key, watch one connection/shard saturate | 4 (basic) / 6 (multi-shard) |
 
-Order within rung 4: TTL jitter (free) → `singleflight` (hard stampede floor)
-→ XFetch (smooths the tail).
+Order within rung 4: **L1 tier → self-healing breaker** (the resilience backbone)
+→ TTL jitter (free) → `singleflight` (hard stampede floor) → XFetch (smooths the
+tail) → bloom (penetration) → hot-key split. Each is earned by a reproduced k6
+failure first; an unproven hardening is just complexity.
 
 ### What is *not* on the RPS ladder
 
@@ -462,7 +474,7 @@ func (s *Service[T]) SoftDelete(ctx, id int64) error
 - [ ] `internal/valkey` — `Client(alias string) (*redis.Client, error)` cached; parse `VALKEY_URL`; `Ping` health; empty URL ⇒ callers use in-memory impls.
 - [ ] `resilience/retry` — `Do(ctx, fn, opts) error`; delay `min(base·2^n, max)·U(0.5,1.5)`; stop on non-retryable (`TripsBreaker==false` and not transient).
 - [ ] `resilience/breaker` — `CLOSED/OPEN/HALF_OPEN`; `Breaker` interface; memory + valkey impls behind `provider.Get(name)`; `Call(ctx, fn)` raises `ServiceUnavailableError` when OPEN; counts only breaker-tripping errors.
-- [ ] `resilience/cache` — `Cache` interface (`Get/Set/Delete`), memory + valkey, fail-open, TTL, dataset-version invalidation.
+- [ ] `resilience/cache` — `Cache` interface (`Get/Set/Delete`), memory + valkey, fail-open, TTL, dataset-version invalidation. **Tiered at rung 4:** bounded in-process L1 → Valkey L2 → DB, a self-healing circuit breaker around L2 (skip a down Valkey, probe to recover), ±TTL jitter, `singleflight`, XFetch, bloom filter, and hot-key splitting — each earned by a reproduced k6 failure.
 - [ ] `resilience/throttle` — sliding-window `Check(ctx, id, limit, window) (Result, error)`; scopes (user-tier/burst/global/endpoint/ip); `ParseRate("100/min")`; feeds Phase-2 rate-limit headers via a gin dependency `RateLimit(scope, rate)`.
 - [ ] `resilience/registry` — per-service config from `Config`; `Resilient(ctx, name, fn)` = breaker(retry(fn)).
 
@@ -637,7 +649,8 @@ discarded — only its *entry point on the hot path* is re-sequenced.
 | 3 | 2 | Indexes — kill Seq Scans | — | |
 | 4 | 3 | Pool tuning, hot-query EXPLAIN | — | |
 | 5 | 4 | **Cache-aside** (Valkey cache from `phase5-built`) on the hot read | 4 | |
-| 6 | 4→6 | **Cache hardening** — TTL jitter → singleflight → XFetch → bloom → hot-key (each symptom-gated) | new | |
+| 6 | 4 | **Resilient tiered cache** — L1 memory → L2 Valkey → DB + self-healing breaker around Valkey | 4 | |
+| 6b | 4 | **Cache hardening** — TTL jitter → singleflight → XFetch → bloom → hot-key split (each symptom-gated) | new | |
 | 7 | 5 | **Observability** (OTel → Tempo/Prometheus/Loki/Grafana) — single binary goes blind here | 8 | |
 | 8 | 5 | **Rate-limit throttle** (edge hardening) — bounded per-IP map (fixes memory-leak) | 4 | |
 | 9 | 5 | **Async audit log** — proven off-path via the ON/OFF matrix | 7 | |
