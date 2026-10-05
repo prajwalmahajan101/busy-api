@@ -4,13 +4,17 @@ package items
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prajwalmahajan101/busyapi/internal/db"
 	"github.com/prajwalmahajan101/busyapi/internal/errs"
 	"github.com/prajwalmahajan101/busyapi/internal/reqcontext"
+	"github.com/prajwalmahajan101/busyapi/internal/resilience/cache"
 	"github.com/prajwalmahajan101/busyapi/internal/store"
 	storedb "github.com/prajwalmahajan101/busyapi/internal/store/db"
 )
@@ -46,13 +50,20 @@ const (
 // Service is the business layer over the sqlc store. Every call runs under the
 // DB query timeout
 type Service struct {
-	pool *pgxpool.Pool
-	q    *storedb.Queries
+	pool     *pgxpool.Pool
+	q        *storedb.Queries
+	cache    cache.Cache
+	cacheTTL time.Duration
 }
 
-func NewService(pool *pgxpool.Pool) *Service {
-	return &Service{pool: pool, q: storedb.New(pool)}
+// NewService wires the store and a cache-aside backend for the single-item hot
+// read. The cache is fail-open (a Valkey outage reports a miss), so a cache
+// failure never surfaces as a 5xx — it just falls through to Postgres.
+func NewService(pool *pgxpool.Pool, c cache.Cache, ttl time.Duration) *Service {
+	return &Service{pool: pool, q: storedb.New(pool), cache: c, cacheTTL: ttl}
 }
+
+func itemCacheKey(id int64) string { return fmt.Sprintf("item:%d", id) }
 
 func (s *Service) Create(ctx context.Context, notes []byte) (storedb.Item, error) {
 	defer reqcontext.TrackService(ctx)()
@@ -70,6 +81,19 @@ func (s *Service) Create(ctx context.Context, notes []byte) (storedb.Item, error
 
 func (s *Service) Get(ctx context.Context, id int64) (storedb.Item, error) {
 	defer reqcontext.TrackService(ctx)()
+
+	// Cache-aside: a hit serves the read without touching the DB pool — the
+	// whole point of the rung, since the pool is the scarce resource under load.
+	key := itemCacheKey(id)
+	if b, hit, _ := s.cache.Get(ctx, key); hit {
+		var item storedb.Item
+		if json.Unmarshal(b, &item) == nil {
+			return item, nil
+		}
+		// Corrupt entry: drop it and fall through to the DB.
+		_ = s.cache.Delete(ctx, key)
+	}
+
 	ctx, cancel := db.WithQueryTimeout(ctx)
 	defer cancel()
 
@@ -81,6 +105,10 @@ func (s *Service) Get(ctx context.Context, id int64) (storedb.Item, error) {
 			return storedb.Item{}, errs.NewNotFound(msgItemNotFound)
 		}
 		return storedb.Item{}, errs.NewInfrastructure(msgGetFailed)
+	}
+
+	if b, err := json.Marshal(item); err == nil {
+		_ = s.cache.Set(ctx, key, b, s.cacheTTL)
 	}
 	return item, nil
 }
@@ -117,7 +145,7 @@ func (s *Service) SoftDelete(ctx context.Context, id int64) error {
 	if err != nil {
 		return errs.NewInfrastructure(msgSoftDeleteFailed)
 	}
-
+	_ = s.cache.Delete(ctx, itemCacheKey(id))
 	return nil
 }
 
@@ -132,5 +160,6 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 	if err != nil {
 		return errs.NewInfrastructure(msgDeleteFailed)
 	}
+	_ = s.cache.Delete(ctx, itemCacheKey(id))
 	return nil
 }

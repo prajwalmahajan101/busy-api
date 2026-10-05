@@ -52,6 +52,9 @@ type Config struct {
 	// An empty string disables Valkey and activates in-memory fallbacks.
 	ValkeyURL string `env:"VALKEY_URL" envDefault:"redis://localhost:6379/0"`
 
+	// CacheItemTTLS is the cache-aside TTL for single-item reads, in seconds.
+	CacheItemTTLS int `env:"CACHE_ITEM_TTL_S" envDefault:"300"`
+
 	// -------------------------------------------------------------------------
 	// Logging
 	// -------------------------------------------------------------------------

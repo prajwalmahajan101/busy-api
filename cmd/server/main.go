@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -16,7 +17,9 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/items"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
 	"github.com/prajwalmahajan101/busyapi/internal/middleware"
+	"github.com/prajwalmahajan101/busyapi/internal/resilience/cache"
 	"github.com/prajwalmahajan101/busyapi/internal/response"
+	"github.com/prajwalmahajan101/busyapi/internal/valkey"
 )
 
 // Response bodies for the temporary infra routes.
@@ -48,7 +51,18 @@ func run(logger *slog.Logger) error {
 	}
 	defer db.Close(pool)
 
-	r := buildRouter(cfg, logger, pool)
+	// Cache-aside backend for the hot read. A nil Valkey client (VALKEY_URL
+	// empty or unreachable at build time) makes the provider hand out an
+	// in-memory cache; Valkey errors at runtime fail open as misses.
+	valkey.Configure(cfg.ValkeyURL)
+	rdb, err := valkey.Client("cache")
+	if err != nil {
+		return fmt.Errorf("valkey client: %w", err)
+	}
+	defer func() { _ = valkey.Close() }()
+	itemCache := cache.NewProvider(rdb).Get("items")
+
+	r := buildRouter(cfg, logger, pool, itemCache)
 	return r.Run(":" + cfg.Port)
 }
 
@@ -65,16 +79,16 @@ func initDB(ctx context.Context, cfg *config.Config) (*pgxpool.Pool, error) {
 // documented order via middleware.Setup, then registers every route. No
 // business logic lives here. The per-IP throttle group returns at rung 5 (T30),
 // when the resilience/throttle backend is re-introduced.
-func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool) *gin.Engine {
+func buildRouter(cfg *config.Config, logger *slog.Logger, pool *pgxpool.Pool, itemCache cache.Cache) *gin.Engine {
 	r := gin.New()
 	middleware.Setup(r, cfg, logger)
-	registerRoutes(r, pool)
+	registerRoutes(r, pool, itemCache, time.Duration(cfg.CacheItemTTLS)*time.Second)
 	return r
 }
 
 // registerRoutes is the single home for every HTTP route: infra routes and, for
 // now, domain routes on the root engine.
-func registerRoutes(r *gin.Engine, pool *pgxpool.Pool) {
+func registerRoutes(r *gin.Engine, pool *pgxpool.Pool, itemCache cache.Cache, cacheTTL time.Duration) {
 	r.GET("/ping", func(c *gin.Context) {
 		response.Success(c, http.StatusOK, msgPong, nil)
 	})
@@ -84,5 +98,5 @@ func registerRoutes(r *gin.Engine, pool *pgxpool.Pool) {
 		response.Error(c, errs.NewNotFound(msgResourceNotFound))
 	})
 
-	items.NewHandler(items.NewService(pool)).RegisterRoutes(r)
+	items.NewHandler(items.NewService(pool, itemCache, cacheTTL)).RegisterRoutes(r)
 }
