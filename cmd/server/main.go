@@ -68,6 +68,7 @@ func run(logger *slog.Logger) error {
 		L1TTL:                time.Duration(cfg.CacheL1TTLS) * time.Second,
 		BreakerFailThreshold: cfg.CacheBreakerFailThreshold,
 		BreakerRecovery:      time.Duration(cfg.CacheBreakerRecoveryS) * time.Second,
+		TTLJitterPct:         cfg.CacheTTLJitterPct,
 	})
 
 	r := buildRouter(cfg, logger, pool, itemCache)

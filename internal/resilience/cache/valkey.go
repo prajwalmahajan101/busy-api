@@ -9,12 +9,13 @@ import (
 )
 
 type valkeyCache struct {
-	rdb    *redis.Client
-	prefix string
+	rdb       *redis.Client
+	prefix    string
+	jitterPct int // ±pct spread on Set TTL to avoid synchronized expiry (T24)
 }
 
-func newValkeyCache(name string, rdb *redis.Client) *valkeyCache {
-	return &valkeyCache{rdb: rdb, prefix: "cache:" + name + ":"}
+func newValkeyCache(name string, rdb *redis.Client, jitterPct int) *valkeyCache {
+	return &valkeyCache{rdb: rdb, prefix: "cache:" + name + ":", jitterPct: jitterPct}
 }
 
 func (c *valkeyCache) key(k string) string {
@@ -36,7 +37,7 @@ func (c *valkeyCache) Get(ctx context.Context, key string) ([]byte, bool, error)
 }
 
 func (c *valkeyCache) Set(ctx context.Context, key string, val []byte, ttl time.Duration) error {
-	return c.rdb.Set(ctx, c.key(key), val, ttl).Err()
+	return c.rdb.Set(ctx, c.key(key), val, jitteredTTL(ttl, c.jitterPct)).Err()
 }
 
 func (c *valkeyCache) Delete(ctx context.Context, key string) error {

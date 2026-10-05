@@ -40,7 +40,7 @@ func (p *Provider) Get(name string) Cache {
 	}
 	var c Cache
 	if p.rdb != nil {
-		c = FailOpen(newValkeyCache(name, p.rdb)) // valkey propagates errors; fail open here
+		c = FailOpen(newValkeyCache(name, p.rdb, 0)) // valkey propagates errors; fail open here (no TTL jitter on this generic path)
 	} else {
 		c = newMemoryCache()
 	}

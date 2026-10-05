@@ -25,6 +25,7 @@ type TierConfig struct {
 	L1TTL                time.Duration
 	BreakerFailThreshold int
 	BreakerRecovery      time.Duration
+	TTLJitterPct         int // ±pct spread on L2 Set TTL to avoid synchronized expiry (T24)
 }
 
 // NewTiered builds the hot-read cache for name. A nil rdb (Valkey disabled) falls
@@ -35,7 +36,7 @@ func NewTiered(name string, rdb *redis.Client, cfg TierConfig) Cache {
 		return newMemoryCache() // Valkey disabled — in-process fallback
 	}
 	l2 := newBreakerCache(
-		newValkeyCache(name, rdb),
+		newValkeyCache(name, rdb, cfg.TTLJitterPct),
 		breaker.NewMemory("cache:"+name, breaker.Config{
 			FailThreshold: cfg.BreakerFailThreshold,
 			Recovery:      cfg.BreakerRecovery,

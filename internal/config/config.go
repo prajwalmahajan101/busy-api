@@ -65,6 +65,10 @@ type Config struct {
 	// CacheL1TTLS is the short L1 TTL in seconds (L1 may serve slightly stale).
 	CacheL1TTLS int `env:"CACHE_L1_TTL_S" envDefault:"30"`
 
+	// CacheTTLJitterPct spreads the L2 (Valkey) Set TTL by ±pct so a burst-warmed
+	// working set does not all expire in one instant (cache avalanche, T24).
+	CacheTTLJitterPct int `env:"CACHE_TTL_JITTER_PCT" envDefault:"10"`
+
 	// CacheBreakerFailThreshold is the number of Valkey failures before the cache
 	// breaker OPENs (skips Valkey, no per-request dial tax).
 	CacheBreakerFailThreshold int `env:"CACHE_BREAKER_FAIL_THRESHOLD" envDefault:"5"`
