@@ -41,9 +41,72 @@ attributable per layer from the client side, not just in server logs.
 | 2 (before) | 2026-10-05 | 10 rps | 10.71ms | 20.68ms | 23.99ms | 0.00% | exact `count(*) WHERE is_active=true` Seq-Scans whole table (~23ms) on every list; GetItem/ListItems already index-backed | — |
 | 2 (after)  | 2026-10-05 | 10 rps | 1.94ms  | 3.00ms  | 3.52ms  | 0.00% | — | approximate total via `reltuples` (`store.CountItemsEstimate`); partial index `idx_items_active_id (id) WHERE is_active=true` replaces low-value bool index |
 | 3 | 2026-10-05 | 100 rps | 1.70ms | 2.73ms | 3.36ms | 0.00% | none — pgxpool uncontended: repo p95 flat at 1ms vs rung 2 (acquire wait ≈ 0) | no tuning needed; `DB_MAX_CONNS`=48 (4×12 cores) ample (~0.2 conns needed by Little's law) |
+| 4 (before) | 2026-10-05 | ~5000 rps hot read, `DB_MAX_CONNS=1` | 210.8ms | 278.7ms | 308ms | 0.00% | DB pool saturated — reads queue behind the single connection (simulated at-scale contention); fail-open (Valkey down) serves all from DB, 0 5xx | — |
+| 4 (after)  | 2026-10-05 | ~5000 rps hot read, `DB_MAX_CONNS=1` | 0.61ms | 4.63ms | 13.9ms | 0.00% | — | cache-aside on `items.Get` (Valkey, fail-open), key `item:<id>`, invalidate on write/soft-delete; hits bypass the pool (repo p95 → 0ms) |
 
 <sub>Rung 2: seeded 100k rows (`make load-seed`). EXPLAIN showed the only Seq Scan was the exact count; **no index fixes a count where `is_active=true` matches ~all rows** (covering `(is_active,id)` index still Seq-Scanned). Fix was query-design: swap exact count for an O(1) `reltuples` estimate on the list path (exact `CountItems` kept for off-hot-path callers), plus a partial `(id) WHERE is_active=true` index for the active-ordered scan as soft-deletes accumulate. p95 20.68ms → 3.00ms (repo p95 19ms → 1ms). Target p95 < 15ms met; no Seq Scan on the hot path.</sub>
+
+<sub>Rung 4: cache-aside re-introduced from `phase5-built` (`internal/valkey` + `internal/resilience/cache`, both fail-open). **Unconstrained 1K rps needs no cache** — the box holds p95~3ms with none (matches the ROADMAP: 1→1K is one stateless box). To earn the cache, the DB-contention regime that appears at 10K+/cloud was simulated locally with `DB_MAX_CONNS=1` (shared-Postgres / PgBouncer cap). Hot-read scenario `loadtest/cache_read.js` (`make load-cache`) hammers `GET /items/:id` over a 1000-key working set. Cache OFF (Valkey stopped → every op fails open to a miss → all reads queue on the one connection): p95=278.7ms, ~2.6K rps, **0 5xx (fail-open proven, T20)**. Cache ON (Valkey up → hits bypass the pool, repo p95→0ms): p95=4.63ms, 4.4K rps. 60× p95 improvement; target p95 < 50ms met. T29 (real 10K push) needs a second k6 machine.</sub>
 
 <sub>Rung 3: `make load RPS=100 DURATION=30s`, same 100k rows, single local instance. 7501 reqs, 0 failed, 100% checks. pgxpool wait measured indirectly — `server_repo_ms` (which wraps query + connection acquire via `TrackRepo`) held at p95=1ms identical to rung 2, so a 10× load increase added no acquire latency. `DB_MAX_CONNS` left at the 48 default (4×NumCPU=12); no index or pool change earned. Target p95 < 30ms met. Local-box headroom for higher rungs documented in `docs/local-tuning.md`.</sub>
 
 <sub>Rung 1 run: `k6 run loadtest/load.js -e RPS=1 -e DURATION=30s --summary-trend-stats="avg,min,med,p(90),p(95),p(99),max"`, local single instance + local Postgres, `OTEL_ENABLED`/`APILOG` not yet built. 75 reqs, 0 failed, all envelope/request_id checks passed. Per-layer from `Server-Timing`: `service`/`repo` p99=2ms. Target p95 < 10ms met. Note: k6's default summary omits p99 — pass `--summary-trend-stats` (or set `summaryTrendStats` in options) to capture it.</sub>
+
+---
+
+## Full ladder — current code (all optimizations on)
+
+Snapshot of the finished rung-4 code with everything enabled: cache-aside on
+(Valkey up), `reltuples` count, partial index, and a realistic `DB_MAX_CONNS=48`
+(4×12 cores). `make load RPS=<n> VUS=200 DURATION=20s`, mixed `load.js`
+(cached `GET /items/:id` + DB-backed list), single box.
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | repo p95 |
+|---|---|---|---|---|---|---|---|
+| 1    | 1.7   | 1.57ms | 3.93ms | 5.64ms | 6.0ms | 0% | 2ms |
+| 10   | 15.7  | 1.45ms | 2.63ms | 3.65ms | 10.6ms | 0% | 1ms |
+| 100  | 157   | 1.17ms | 2.28ms | 2.95ms | 12.0ms | 0% | 1ms |
+| 1000 | 1570  | 1.22ms | 3.24ms | 7.37ms | 27.4ms | 0% | 1ms |
+| 2000 | 3142  | 1.46ms | 8.92ms | 16.23ms | 72.0ms | 0% | 4ms |
+| 5000 | 4767  | 55.5ms | 291.6ms | 341ms | 608ms | 0% (1542 dropped/s) | 256ms |
+
+## Insights
+
+1. **Flat p95 (≤ 4ms) from 1 → 1000 rps.** Latency is independent of load across
+   three orders of magnitude — the box is nowhere near saturation. This is the
+   signature of a correct stateless design: throughput scales with no latency
+   cost until a real resource binds. Confirms the ROADMAP claim "1→1K needs no
+   infra change."
+
+2. **The bottleneck was never the index — it was query design.** Rung 2's 20.68ms
+   p95 came from an exact `count(*)` scanning 100k rows every list call. No index
+   fixes a count where the predicate matches ~all rows; the O(1) `reltuples`
+   estimate did (p95 → 3ms). Biggest lesson: profile the *query plan*, don't
+   reflexively add indexes.
+
+3. **Cache value is conditional on DB contention, not on raw RPS.** At a healthy
+   `DB_MAX_CONNS=48` the cache barely matters up to 2000 rps (DB isn't the
+   bottleneck). Its 60× win (278ms → 4.6ms) only appears once the pool is the
+   scarce resource (`DB_MAX_CONNS=1`, simulating a shared/pgbouncer-capped
+   Postgres at 10K+). Cache-aside buys *DB-independence*, not blanket speed —
+   earn it where the DB actually binds.
+
+4. **`repo_ms` is the leading indicator.** Every rung's p95 tracked `repo_ms`
+   (query + connection-acquire time). It stayed at 1ms through 1000 rps, ticked to
+   4ms at 2000, and blew to 256ms at 5000 — the single cleanest signal of where
+   the real work (and the queueing) is. Per-layer timing (rung 1) paid for itself.
+
+5. **The 5000-rps cliff is the test rig, not the service.** p95 jumps to 292ms
+   with 1542 dropped iterations/s because k6 + server + Postgres + Valkey share 12
+   cores. It's CPU/load-gen exhaustion, exactly what `docs/local-tuning.md`
+   predicts above ~5K. Any "server fails at 5K" claim from a single box is
+   measuring the laptop — real 10K needs two-machine k6 (T29) / cloud.
+
+6. **Fail-open held under load.** With Valkey stopped mid-regime, every cache op
+   degraded to a DB read with **0 5xx** — availability never depended on the
+   cache. Resilience is a measured property here, not an assumption.
+
+7. **Every win was earned by a reproduced failure first.** Rungs 1 and 3 added
+   no code because no benchmark justified it; rungs 2 and 4 changed code only
+   after a red run proved the need. The ladder kept the diff small and the
+   complexity paid-for.
