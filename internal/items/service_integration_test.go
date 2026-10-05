@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -142,6 +143,77 @@ func TestCacheFailOpen_Integration(t *testing.T) {
 	}
 	if got.ID != created.ID {
 		t.Fatalf("Get returned id %d, want %d", got.ID, created.ID)
+	}
+}
+
+// barrierCache is a cache.Cache for the singleflight test: every Get blocks until
+// all N callers have arrived, then returns a miss — forcing all N into the loader
+// at once (the exact concurrent-miss condition the stampede needs). It counts Set
+// calls, which in Service.Get follow a successful DB read, so setCount == DB loads.
+type barrierCache struct {
+	n       int
+	mu      sync.Mutex
+	arrived int
+	release chan struct{}
+	sets    int
+}
+
+func newBarrierCache(n int) *barrierCache { return &barrierCache{n: n, release: make(chan struct{})} }
+
+func (c *barrierCache) Get(_ context.Context, _ string) ([]byte, bool, error) {
+	c.mu.Lock()
+	c.arrived++
+	if c.arrived == c.n {
+		close(c.release) // last arrival frees everyone — now all miss together
+	}
+	c.mu.Unlock()
+	<-c.release
+	return nil, false, nil // always a miss
+}
+
+func (c *barrierCache) Set(_ context.Context, _ string, _ []byte, _ time.Duration) error {
+	c.mu.Lock()
+	c.sets++
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *barrierCache) Delete(_ context.Context, _ string) error { return nil }
+
+// TestSingleflight_CollapsesConcurrentMisses proves T26: N concurrent misses on
+// the same key collapse to a single DB load. The barrier guarantees the concurrent
+// condition deterministically (not by timing luck); without singleflight each of
+// the N misses would Set once (N DB loads) — with it, exactly one.
+func TestSingleflight_CollapsesConcurrentMisses(t *testing.T) {
+	pool := setupPool(t)
+	ctx := context.Background()
+
+	created, err := NewService(pool, memCache(), time.Minute).Create(ctx, []byte(`{"hot":1}`))
+	if err != nil {
+		t.Fatalf("seed create: %v", err)
+	}
+
+	const n = 50
+	bc := newBarrierCache(n)
+	svc := NewService(pool, bc, time.Minute)
+
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for range n {
+		go func() {
+			defer wg.Done()
+			if _, gErr := svc.Get(ctx, created.ID); gErr != nil {
+				t.Errorf("concurrent Get: %v", gErr)
+			}
+		}()
+	}
+	wg.Wait()
+
+	bc.mu.Lock()
+	sets := bc.sets
+	bc.mu.Unlock()
+	if sets != 1 {
+		t.Fatalf("cache Set called %d times; want 1 — singleflight must collapse %d concurrent misses to one DB load", sets, n)
 	}
 }
 

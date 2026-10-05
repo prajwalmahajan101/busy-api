@@ -17,6 +17,7 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/resilience/cache"
 	"github.com/prajwalmahajan101/busyapi/internal/store"
 	storedb "github.com/prajwalmahajan101/busyapi/internal/store/db"
+	"golang.org/x/sync/singleflight"
 )
 
 // Error messages emitted by this package, named so handler and service share one
@@ -54,6 +55,7 @@ type Service struct {
 	q        *storedb.Queries
 	cache    cache.Cache
 	cacheTTL time.Duration
+	sf       singleflight.Group // collapses concurrent same-key cache misses (T26)
 }
 
 // NewService wires the store and a cache-aside backend for the single-item hot
@@ -94,23 +96,38 @@ func (s *Service) Get(ctx context.Context, id int64) (storedb.Item, error) {
 		_ = s.cache.Delete(ctx, key)
 	}
 
-	ctx, cancel := db.WithQueryTimeout(ctx)
-	defer cancel()
+	// singleflight: when a hot key expires, many requests miss at once; collapse
+	// the concurrent misses so exactly one goroutine reads the DB + repopulates
+	// and the rest share its result (cache stampede, T26). Keyed by cache key.
+	//
+	// ponytail: Do shares the leader's ctx — a cancelled leader fails its followers;
+	// fine for a sub-ms PK read, revisit with DoChan if the loader grows slow.
+	// ponytail: no in-closure cache re-check — singleflight already collapses the
+	// concurrent burst and the leader's Set makes the next arrivals hit; add one
+	// only if a post-leader micro-race shows up in the numbers.
+	v, err, _ := s.sf.Do(key, func() (any, error) {
+		ctx, cancel := db.WithQueryTimeout(ctx)
+		defer cancel()
 
-	stopRepo := reqcontext.TrackRepo(ctx)
-	item, err := s.q.GetItem(ctx, id)
-	stopRepo()
+		stopRepo := reqcontext.TrackRepo(ctx)
+		item, err := s.q.GetItem(ctx, id)
+		stopRepo()
+		if err != nil {
+			return storedb.Item{}, err
+		}
+
+		if b, err := json.Marshal(item); err == nil {
+			_ = s.cache.Set(ctx, key, b, s.cacheTTL)
+		}
+		return item, nil
+	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return storedb.Item{}, errs.NewNotFound(msgItemNotFound)
 		}
 		return storedb.Item{}, errs.NewInfrastructure(msgGetFailed)
 	}
-
-	if b, err := json.Marshal(item); err == nil {
-		_ = s.cache.Set(ctx, key, b, s.cacheTTL)
-	}
-	return item, nil
+	return v.(storedb.Item), nil
 }
 
 func (s *Service) List(ctx context.Context, page, size int) ([]storedb.Item, int64, error) {
