@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prajwalmahajan101/busyapi/internal/config"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
+	"github.com/prajwalmahajan101/busyapi/internal/resilience/cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -19,7 +20,7 @@ const reqIDHeader = "X-Request-ID"
 func routerWithMaxBody(maxBytes int64) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{MaxBodyBytes: maxBytes, Env: "local"}
-	return buildRouter(cfg, logging.Setup(), nil)
+	return buildRouter(cfg, logging.Setup(), nil, cache.NewProvider(nil).Get("test"))
 }
 
 func TestStackOversizedBodyReturns413(t *testing.T) {

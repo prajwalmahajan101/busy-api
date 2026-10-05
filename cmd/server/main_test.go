@@ -10,6 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prajwalmahajan101/busyapi/internal/config"
 	"github.com/prajwalmahajan101/busyapi/internal/logging"
+	"github.com/prajwalmahajan101/busyapi/internal/resilience/cache"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -55,5 +56,5 @@ func TestErrorTypedErrorEnvelope(t *testing.T) {
 func testRouter() *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{MaxBodyBytes: 1 << 20, Env: "local"}
-	return buildRouter(cfg, logging.Setup(), nil)
+	return buildRouter(cfg, logging.Setup(), nil, cache.NewProvider(nil).Get("test"))
 }
