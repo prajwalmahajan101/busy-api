@@ -82,7 +82,62 @@ attributable per layer from the client side, not just in server logs.
 
 ---
 
+## T29 — two-machine cloud ladder (AWS, c6i.2xlarge)
+
+Two `c6i.2xlarge` (8 vCPU, 16 GB) on the same VPC/AZ (ap-south-1), sub-ms
+network RTT. `DB_MAX_CONNS=16` (2×CPU), all cache tiers on, bloom on, 100k seed.
+
+| Role | Instance | Private IP | Specs |
+|---|---|---|---|
+| API + Postgres (Docker) + Valkey (Docker) | `c6i.2xlarge` | 172.31.22.54 | 8 vCPU, 16 GB, Amazon Linux 2023, Go 1.24 |
+| k6 load generator | `c6i.2xlarge` | 172.31.17.152 | 8 vCPU, 16 GB, Amazon Linux 2023, k6 v0.56 |
+
+### WiFi attempt (failed, for the record)
+
+Two local machines over WiFi (192.168.1.x). Hit the WiFi router's connection-
+tracking limit at ~5K rps — `connection forcibly closed` / `dial tcp: connectex`
+floods starting at ~8K VUs. Server was fine (`server_handler_ms` p95=3ms); the
+router was the bottleneck. Not a valid server measurement.
+
+### Cloud ladder — warm cache
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | dropped/s | repo p95 | VUs used |
+|---|---|---|---|---|---|---|---|---|---|
+| 5,000 | 8,332 | 0.42ms | 0.66ms | 1.12ms | 58ms | 0% | 0 | 0ms | 5–10 |
+| 10,000 | 16,665 | 3.7ms | 108ms | 120ms | 222ms | 0% | 0 | 104ms | 200–1335 |
+| 15,000 | 19,035 | 159ms | **931ms** ❌ | 1.13s | 1.47s | 0% | 2977 | 747ms | 2000–11,064 |
+
+### Cloud — cold cache at 10K rps
+
+Server restarted, Valkey flushed, L1 empty, bloom rebuilt from DB at boot.
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | dropped/s | repo p95 |
+|---|---|---|---|---|---|---|---|---|
+| 10,000 | 16,664 | 5.31ms | 113ms | 127ms | 226ms | 0% | 0 | 107ms |
+
+Cold start ≈ warm: the ramp (0→10K over ~10s) warms L1/L2 before RPS peaks. Bloom builds at boot from `SELECT id FROM items` (100k rows, <100ms). No cold-start penalty.
+
+### Ceiling analysis — why 15K breaks
+
+The bottleneck is the **`/items` list endpoint** hitting Postgres on every request (not cached). At 15K target rps, the `load.js` mix sends ~50% list requests = ~7.5K list/s through a 16-conn pool. `server_repo_ms` p95 jumped from 104ms (10K) to **747ms** (15K) — pure pool-queueing: 7.5K req/s ÷ 16 conns = ~470 concurrent-per-conn at Little's law, far above what 16 connections can serve without queueing.
+
+The cached `GET /items/:id` is still sub-ms at 15K (median 0ms) — the cache tier is not the bottleneck. The problem is that **list is un-cacheable in the current design** (it's paginated, dynamic, and always hits the DB).
+
+### What would fix 15K
+
+1. **Cache the list endpoint** — short-TTL cache of the first few pages (hot pages). Most list traffic hits page 1. A 5s TTL serves ~37,500 page-1 requests from cache per cycle. Biggest single win.
+2. **Increase DB_MAX_CONNS** — 16→32 doubles pool capacity. But this is a band-aid; the list query still scales linearly with RPS.
+3. **Separate Postgres onto its own instance** — gives the DB dedicated CPU/RAM. The shared instance makes Go, Valkey, and Postgres compete for the same 8 vCPUs.
+4. **Read replicas** — route list queries to a read replica. Unlimited horizontal read scale.
+5. **Connection pooler (PgBouncer)** — multiplex 1000s of goroutine connections through 32 real Postgres connections. Eliminates the conn-limit ceiling.
+
+The lazy fix is #1 (cache list page 1) — it's the same cache-aside pattern already proven for single-item reads, and it eliminates ~80% of the DB-bound list traffic.
+
+---
+
 ## Full ladder — current code (all optimizations on)
+
+### Local single-box (12 cores, `DB_MAX_CONNS=48`)
 
 Snapshot of the finished rung-4 code with everything enabled: cache-aside on
 (Valkey up), `reltuples` count, partial index, and a realistic `DB_MAX_CONNS=48`
@@ -97,6 +152,14 @@ Snapshot of the finished rung-4 code with everything enabled: cache-aside on
 | 1000 | 1570  | 1.22ms | 3.24ms | 7.37ms | 27.4ms | 0% | 1ms |
 | 2000 | 3142  | 1.46ms | 8.92ms | 16.23ms | 72.0ms | 0% | 4ms |
 | 5000 | 4767  | 55.5ms | 291.6ms | 341ms | 608ms | 0% (1542 dropped/s) | 256ms |
+
+### Cloud two-machine (c6i.2xlarge, `DB_MAX_CONNS=16`)
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | repo p95 |
+|---|---|---|---|---|---|---|---|
+| 5,000 | 8,332 | 0.42ms | 0.66ms | 1.12ms | 58ms | 0% | 0ms |
+| 10,000 | 16,665 | 3.7ms | 108ms | 120ms | 222ms | 0% | 104ms |
+| 15,000 | 19,035 | 159ms | 931ms ❌ | 1.13s | 1.47s | 0% | 747ms |
 
 ## Insights
 
@@ -216,3 +279,28 @@ Snapshot of the finished rung-4 code with everything enabled: cache-aside on
     N sub-keys across Valkey shards, but that technique addresses L2-level load that
     L1 has already eliminated. Revisit only in a multi-shard, L2-only architecture
     (rung-6 T62) where there is no in-process tier to absorb the hot key.
+
+15. **WiFi is not a load-testing network.** 8000 VUs over a consumer WiFi router
+    saturated the router's NAT table / connection tracking before the server noticed.
+    `server_handler_ms` p95 = 3ms while k6 reported p95 = 220ms — pure network, not
+    server. Two machines on the same WiFi cannot produce a clean test above ~5K rps.
+    Same machines on an AWS VPC (sub-ms RTT) delivered 10K rps at p95 = 108ms. The
+    test rig is always in the measurement; WiFi puts a ~5K ceiling on it.
+
+16. **The ceiling at 15K is the un-cached list endpoint, not the cached read.** At
+    15K rps, `GET /items/:id` (cached) stays at median 0ms — the L1→L2→DB tiered
+    cache, bloom, and singleflight are all working. The bottleneck is `GET /items`
+    (paginated list): every request hits Postgres, no caching. 50% of `load.js`
+    traffic is list = ~7.5K list/s through 16 DB conns → pool queueing → `repo_ms`
+    p95 jumps from 104ms (10K) to 747ms (15K). **The next rung's fix is caching the
+    list endpoint** (short-TTL on hot pages) or scaling the DB tier (read replicas,
+    PgBouncer, separate instance). The single-item cache path has no observable
+    ceiling at this load.
+
+17. **Cold cache is a non-event at ramp-up load patterns.** Cold-cache 10K rps
+    (Valkey flushed, server restarted, L1 empty) produced p95 = 113ms ≈ warm p95 =
+    108ms. The ramp (0→10K over ~10s) warms L1/L2 from the first requests; by peak
+    RPS the working set is cached. The bloom rebuilds from `SELECT id FROM items`
+    at boot (<100ms for 100k rows). Cold-start matters only under instant-spike
+    scenarios (0→10K in <1s) — the ramp pattern used by `load.js` hides it. A spike
+    test (`spike.js`) with a cold cache would expose it if needed.
