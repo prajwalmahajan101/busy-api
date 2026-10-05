@@ -26,6 +26,7 @@ RPS       ?= 100
 VUS       ?= 10
 DURATION  ?= 30s
 N         ?= 100000
+PHASE_S   ?= 30
 
 # Migrations
 MIGRATIONS_DIR := migrations
@@ -43,7 +44,8 @@ DB_DRIVER      := postgres
         dev \
         compose-up compose-down \
         obs-up obs-down \
-        load-smoke load load-stress load-spike load-soak load-matrix load-seed load-cache
+        load-smoke load load-stress load-spike load-soak load-matrix load-seed load-cache \
+        load-cache-resilience
 
 # ---------------------------------------------------------------------------
 # Default target
@@ -162,6 +164,17 @@ load-cache: ## Rung-4 cache-aside hot-read proof (GET /items/:id over KEYS worki
 		-e RPS=$(RPS) \
 		-e VUS=$(VUS) \
 		-e DURATION=$(DURATION)
+
+load-cache-resilience: ## Rung-4b proof: drop/restore Valkey mid-load, per-phase p95 + db_reads (run with DB_MAX_CONNS=1)
+	k6 run loadtest/cache_resilience.js \
+		-e BASE_URL=$(BASE_URL) \
+		-e RPS=$(RPS) \
+		-e VUS=$(VUS) \
+		-e PHASE_S=$(PHASE_S) & \
+	K6_PID=$$!; \
+	sleep $(PHASE_S); echo ">>> stopping valkey (warm -> outage)"; docker compose stop valkey; \
+	sleep $(PHASE_S); echo ">>> starting valkey (outage -> recovery)"; docker compose start valkey; \
+	wait $$K6_PID
 
 load-smoke: ## Run smoke test (1 VU, 30 s) against BASE_URL
 	k6 run loadtest/smoke.js -e BASE_URL=$(BASE_URL)
