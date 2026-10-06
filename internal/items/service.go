@@ -136,23 +136,21 @@ func (s *Service) Get(ctx context.Context, id int64) (storedb.Item, error) {
 	// concurrent burst and the leader's Set makes the next arrivals hit; add one
 	// only if a post-leader micro-race shows up in the numbers.
 	v, err, _ := s.sf.Do(key, func() (any, error) {
-		ctx, cancel := db.WithQueryTimeout(ctx)
+		qctx, cancel := db.WithQueryTimeout(ctx)
 		defer cancel()
 
-		stopRepo := reqcontext.TrackRepo(ctx)
-		item, err := s.q.GetItem(ctx, id)
+		stopRepo := reqcontext.TrackRepo(qctx)
+		item, err := s.q.GetItem(qctx, id)
 		stopRepo()
 		if err != nil {
-			// Negative cache: remember a confirmed-absent id briefly so a repeat
-			// (a bloom false positive) is served from cache, not the DB (T28).
 			if errors.Is(err, pgx.ErrNoRows) {
-				_ = s.cache.Set(ctx, key, tombstone, s.negTTL)
+				_ = s.cache.Set(qctx, key, tombstone, s.negTTL)
 			}
 			return storedb.Item{}, err
 		}
 
 		if b, err := json.Marshal(item); err == nil {
-			_ = s.cache.Set(ctx, key, b, s.cacheTTL)
+			_ = s.cache.Set(qctx, key, b, s.cacheTTL)
 		}
 		return item, nil
 	})

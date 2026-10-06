@@ -28,7 +28,7 @@ type Presence struct {
 // idKey encodes an id into the fixed 8-byte key the bloom hashes.
 func idKey(id int64) []byte {
 	var b [8]byte
-	binary.BigEndian.PutUint64(b[:], uint64(id))
+	binary.BigEndian.PutUint64(b[:], uint64(id)) //nolint:gosec // item ids are positive DB serials; overflow impossible
 	return b[:]
 }
 

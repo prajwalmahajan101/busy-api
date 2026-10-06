@@ -96,7 +96,6 @@ type Config struct {
 	// bloom as a false positive) does not re-hit the DB. Kept short.
 	CacheNegTTLS int `env:"CACHE_NEG_TTL_S" envDefault:"30"`
 
-
 	// -------------------------------------------------------------------------
 	// Logging
 	// -------------------------------------------------------------------------

@@ -18,7 +18,7 @@ func jitteredTTL(base time.Duration, pct int) time.Duration {
 		return base
 	}
 	// Two-sided: delta in [-pct%, +pct%] of base, so the mean stays at base.
-	delta := float64(base) * float64(pct) / 100.0 * (2*rand.Float64() - 1)
+	delta := float64(base) * float64(pct) / 100.0 * (2*rand.Float64() - 1) //nolint:gosec // TTL jitter does not need crypto-strength randomness
 	out := base + time.Duration(delta)
 	if out <= 0 {
 		return base
