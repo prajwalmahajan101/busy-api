@@ -41,9 +41,266 @@ attributable per layer from the client side, not just in server logs.
 | 2 (before) | 2026-10-05 | 10 rps | 10.71ms | 20.68ms | 23.99ms | 0.00% | exact `count(*) WHERE is_active=true` Seq-Scans whole table (~23ms) on every list; GetItem/ListItems already index-backed | — |
 | 2 (after)  | 2026-10-05 | 10 rps | 1.94ms  | 3.00ms  | 3.52ms  | 0.00% | — | approximate total via `reltuples` (`store.CountItemsEstimate`); partial index `idx_items_active_id (id) WHERE is_active=true` replaces low-value bool index |
 | 3 | 2026-10-05 | 100 rps | 1.70ms | 2.73ms | 3.36ms | 0.00% | none — pgxpool uncontended: repo p95 flat at 1ms vs rung 2 (acquire wait ≈ 0) | no tuning needed; `DB_MAX_CONNS`=48 (4×12 cores) ample (~0.2 conns needed by Little's law) |
+| 4 (before) | 2026-10-05 | ~5000 rps hot read, `DB_MAX_CONNS=1` | 210.8ms | 278.7ms | 308ms | 0.00% | DB pool saturated — reads queue behind the single connection (simulated at-scale contention); fail-open (Valkey down) serves all from DB, 0 5xx | — |
+| 4 (after)  | 2026-10-05 | ~5000 rps hot read, `DB_MAX_CONNS=1` | 0.61ms | 4.63ms | 13.9ms | 0.00% | — | cache-aside on `items.Get` (Valkey, fail-open), key `item:<id>`, invalidate on write/soft-delete; hits bypass the pool (repo p95 → 0ms) |
+| 4b (before) | 2026-10-05 | 2000 rps, `DB_MAX_CONNS=1`, Valkey dropped mid-load (outage phase) | 207ms | 268ms | 299ms | 0.00% | single-tier cache: Valkey outage floods the DB (db_reads 7/s→**221/s**, 19,894 reads in the 30s outage) + fail-open miss→DB per request; throughput collapses (iterations dropped). Fail-open held (0 5xx) | — |
+| 4b (after)  | 2026-10-05 | 2000 rps, `DB_MAX_CONNS=1`, Valkey dropped mid-load (outage phase) | 0.34ms | **0.91ms** | 3.05ms | 0.00% | — | tiered L1(LRU)→L2(Valkey, breaker)→DB (T22a/T22b): L1 absorbed the working set (outage db_reads **19,894→0**), breaker skipped the dead Valkey (no dial); outage p95 268ms→0.91ms (294×), full 180k reqs, auto-recovered on restart |
+| 4b (48 conns) | 2026-10-05 | 2000 rps, `DB_MAX_CONNS=48`, Valkey dropped mid-load (outage phase) | 0.39ms | 1.02ms | 3.2ms | 0.00% | at a healthy pool the outage is already mild — 48 idle conns absorb the flood, so the 294× headline is a **low-pool** effect; the fix still keeps DB load flat + kills the cold-read dial tax (see note) | tiered L1+breaker (same build) |
+| 4c-T23 (before) | 2026-10-05 | 500 rps hot read, `CACHE_ITEM_TTL_S=20`, L1 off, `DB_MAX_CONNS=1`; 1000 keys warmed in one burst | 0.98ms | 2.1ms | 2.7ms | 0.00% | **avalanche reproduced** — identical TTL + no-jitter `Set` means all 1000 keys expire in the same instant: `dbsize` collapses **1000→313 in ~1s** and DB reads spike **0/s → 356/s** (Valkey `keyspace_misses` delta) against a flat-zero baseline. Latency barely moves (sub-ms PK reads) — the harm is DB-read *volume*, not p95 | — (T24: ±jitter per Set) |
+| 4c-T24 (after)  | 2026-10-05 | same regime, `CACHE_TTL_JITTER_PCT=10` (shipping default) | 1.0ms | 2.1ms | 2.7ms | 0.00% | — | ±10% L2 TTL jitter (`jitteredTTL` in `valkeyCache.Set`): the 1s cliff becomes a ~6s ramp — peak DB reads **356/s → 250/s**, `dbsize` min **313 → 646**. ±2s band on a 20s TTL, so partial by design; dose-response below |
+| 4c-T25 (before) | 2026-10-05 | 3000 rps all on ONE hot key, `CACHE_ITEM_TTL_S=5`, jitter on (default), L1 off, `DB_MAX_CONNS=1` | 0.87ms | 3.28ms | 8.76ms | 0.00% | **stampede reproduced** — at each expiry of the single hot key, every concurrent in-flight request misses together and runs its own DB read before the first repopulates: **peak M = 41–63 duplicate DB reads for one logical value** (one expiry), 0 between, ~142–257 reads/run over ~8 cycles. Ideal = 1/expiry. Orthogonal to jitter (jitter desyncs *across* keys; one key still has one expiry instant) | — (T26: `singleflight`) |
+| 4c-T26 (after)  | 2026-10-05 | same regime (both rows re-measured with the DB-layer instrument, Postgres `items.idx_scan`) | 0.94ms | 3.56ms | 7.29ms | 0.00% | — | `x/sync/singleflight` in `Service.Get`, keyed by cache key: concurrent same-key misses collapse to one DB read. Per-expiry DB reads **41 → 1** (peak), run total **142 → 8** (≈1/cycle = ideal). Latency unchanged (followers wait on the leader's sub-ms read instead of queuing on the 1 conn). Integration test `TestSingleflight_CollapsesConcurrentMisses` asserts it directly (1 `Set` for 50 barrier-synced concurrent misses) |
+| 4c-T28 (before) | 2026-10-05 | 3000 rps target, every request a **fresh random absent id** (`100M+rand`, seed is ids 2–100001), bloom off, L1 off, `DB_MAX_CONNS=1` | 263.6ms | 369ms | 409.7ms | 100%† | **penetration reproduced** — no id ever resolves, so nothing caches a hit and no two requests share a key (singleflight/L1/L2 all inert). Every request falls through to `GetItem` → `ErrNoRows` → one PK index scan: **total DB reads = 43,867 ≈ served requests (44,205); peak db_reads/s = 3,054 tracks RPS 1:1**. The 1-conn pool saturates → p95 **369ms** (1.8× the 200ms budget), actual throughput throttled to ~1.46k rps (45.8k iters dropped). †100% `http_req_failed` = all 404 by design (not errors). At `DB_MAX_CONNS=48` latency is fine (p95 27ms) but the DB still eats 100% of the flood (**87,685 scans / 30s, peak 4,398/s**) — the problem is sustained wasted DB work, not tail latency | — (bloom pre-filter + negative cache) |
+| 4c-T28 (after)  | 2026-10-05 | same regime, `CACHE_BLOOM_ENABLED=true` (default), `DB_MAX_CONNS=1` | 0.47ms | 3.48ms | 14.3ms | 100%† | — | In-process bloom pre-filter (`bits-and-blooms/bloom/v3`) + negative-cache tombstone on `ErrNoRows`. **DB reads 43,867 → 0** (total), **3,054/s → 0/s** (peak). Every absent id is answered in-process before any cache or DB touch. p95 **369ms → 3.5ms** (latency is a side effect of not touching the pool at all). Full 3k rps served (0 dropped vs 45.8k dropped). Negative-cache tombstone covers the bloom's false positives (gap ids that pass the filter reach the DB once, then are cached as absent for `CACHE_NEG_TTL_S=30`). Tests: `TestPresence_NoFalseNegatives`, `TestBloomShortCircuit_Integration`, `TestNegativeCache_Integration` |
+| 4c-T28a | 2026-10-05 | 3000 rps single hot key (`HOT_ID=2`), **L1 ON** (shipping config), `CACHE_ITEM_TTL_S=300`, `DB_MAX_CONNS=1` | 0.60ms | 1.54ms | 6.04ms | 0.00% | **not earned** — L1 absorbs the hot key entirely in-process: **db_reads = 2** (initial fill + 1 L1-TTL re-read), **valkey_hits = 5** (initial fill only), 89,993/90,000 requests served from L1 (map lookup, no network). The hot-key Valkey-saturation failure mode cannot reproduce with L1 on — there is no Valkey connection to saturate. Key-splitting is for a multi-shard L2-only architecture where no L1 exists | — (not needed) |
+
+> **Caveat — every `4c-*` before-number is `DB_MAX_CONNS=1` *simulated* contention, not a healthy pool.** At the realistic `DB_MAX_CONNS=48` these herds/stampedes are absorbed by idle connections (sub-ms, no latency impact — insight #3/#8), so the 4c fixes are **insurance for the contended regime** (shared/pgbouncer-capped Postgres at 10K+ / cloud), not wins observed at a healthy pool on this box.
+>
+> **Gate rule for all 4c tasks: measure DB read count (`pg_stat_user_tables.idx_scan` delta), not tail latency.** Every 4c failure (avalanche, stampede, penetration, boundary expiry) is a DB-*work* problem: wasted index scans that scale with RPS and key count. Latency is a lagging symptom that a healthy pool absorbs — it masks the problem at 48 conns and only surfaces once the pool is contended (insights #9, #12). The success metric for every 4c before/after pair is `idx_scan spike → flat (~0)`, not `p95 < budget`.
 
 <sub>Rung 2: seeded 100k rows (`make load-seed`). EXPLAIN showed the only Seq Scan was the exact count; **no index fixes a count where `is_active=true` matches ~all rows** (covering `(is_active,id)` index still Seq-Scanned). Fix was query-design: swap exact count for an O(1) `reltuples` estimate on the list path (exact `CountItems` kept for off-hot-path callers), plus a partial `(id) WHERE is_active=true` index for the active-ordered scan as soft-deletes accumulate. p95 20.68ms → 3.00ms (repo p95 19ms → 1ms). Target p95 < 15ms met; no Seq Scan on the hot path.</sub>
+
+<sub>Rung 4: cache-aside re-introduced from `phase5-built` (`internal/valkey` + `internal/resilience/cache`, both fail-open). **Unconstrained 1K rps needs no cache** — the box holds p95~3ms with none (matches the ROADMAP: 1→1K is one stateless box). To earn the cache, the DB-contention regime that appears at 10K+/cloud was simulated locally with `DB_MAX_CONNS=1` (shared-Postgres / PgBouncer cap). Hot-read scenario `loadtest/cache_read.js` (`make load-cache`) hammers `GET /items/:id` over a 1000-key working set. Cache OFF (Valkey stopped → every op fails open to a miss → all reads queue on the one connection): p95=278.7ms, ~2.6K rps, **0 5xx (fail-open proven, T20)**. Cache ON (Valkey up → hits bypass the pool, repo p95→0ms): p95=4.63ms, 4.4K rps. 60× p95 improvement; target p95 < 50ms met. T29 (real 10K push) needs a second k6 machine.</sub>
+
+<sub>Rung 4b: single-tier fail-open has a failure mode 4a didn't test — a Valkey outage **mid-load**. New scenario `loadtest/cache_resilience.js` (`make load-cache-resilience`) runs a steady 2000 rps split into warm→outage→recovery phases, dropping Valkey via `docker stop` at the warm→outage boundary and restoring it at outage→recovery, with per-phase p95 + a `db_reads` counter (repo_ms>0). **Before (single-tier):** outage p95 268ms, db_reads 221/s (DB flood — every miss hits the one connection), throughput collapsed. **After (tiered L1→L2→DB + self-healing breaker, T22a/T22b):** a bounded in-process LRU (`CACHE_L1_MAX`, `CACHE_L1_TTL_S`) absorbs the working set so outage db_reads → **0**; an in-memory circuit breaker around Valkey OPENs after `CACHE_BREAKER_FAIL_THRESHOLD` failures and skips the dead backend (no dial), HALF_OPEN-probing every `CACHE_BREAKER_RECOVERY_S` to self-heal on restart. Outage p95 268ms → **0.91ms (294×)**, 0 5xx, full 180k reqs. In-memory breaker (not Valkey-backed) by design — a breaker whose state needs Valkey is useless when Valkey is down. ADR 0007. L1 TTL set to 120s for the proof so L1 holds across the 30s outage (default 30s). Hardening (jitter/singleflight/bloom/hot-key, T23–T28a) remains symptom-gated.</sub>
+
+<sub>Rung 4b — pool-size sweep + the unmasked dial tax. Re-ran the same scenario at the realistic `DB_MAX_CONNS=48`: outage p95 only **1.02ms** (tiered) and ~0.9ms even single-tier — 48 idle connections absorb the DB flood, so a Valkey outage is already mild on latency at a healthy pool. **The 294× headline is a low-pool effect** (it needs the DB pool to be the scarce resource, i.e. a shared/pgbouncer-capped Postgres at 10K+) — consistent with insight #3. What the fix still buys at 48 conns: DB load stays flat during the outage, and it removes the **per-cold-read dial tax**. A single-request micro-test (Valkey down, one cold `GET /items/:id`) isolates it: **L1 off → 3577ms** (go-redis hangs ~3.5s dialing the dead backend before the breaker opens); **L1 on → 0ms** (served from L1). The loaded k6 *masks* this — under 2000 rps the breaker trips in the first ~3.5s window, then the DB path (queued at 1 conn / sub-ms at 48) dominates — which is why the dial tax shows up starkly only in the micro-test. **Measurement caveat:** the `db_reads` counter keys on `Server-Timing repo;dur>0`, and that header is **integer-ms**, so sub-ms DB reads (what 48 idle conns deliver) round to 0 and are undercounted — `db_reads` is reliable only under real contention (`DB_MAX_CONNS=1`, reads ≫1ms, e.g. the 19,894 above); at 48 conns trust latency, not the counter. **Follow-up (not in this change):** cap go-redis `DialTimeout` (~200ms) in `internal/valkey/client.go` so the breaker trips faster and the outage-onset spike is bounded even before it OPENs.</sub>
+
+<sub>Rung 4c — T23 (avalanche proof, no fix yet). New scenario `loadtest/cache_avalanche.js` (`make load-cache-avalanche`) warms every key in one burst (`shared-iterations`, so they share an absolute expiry), then reads steadily across the TTL boundary. **DB-read volume is measured from Valkey `keyspace_misses`, not the k6 `db_reads` counter** — the 4b caveat above proved `Server-Timing repo;dur` rounds sub-ms PK reads to 0, so that detector is blind to a fast herd; with L1 off every L2 miss is exactly one DB read, so the per-second `keyspace_misses` delta (polled by the make target) is the exact DB-read rate. Run with `CACHE_ITEM_TTL_S=20 CACHE_L1_ENABLED=false` (short TTL lands the avalanche in-window; L1 off so its own TTL can't mask the L2 expiry). **Result:** flat 0/s baseline for ~15s, then at the synchronized boundary `dbsize` craters 1000→313 and DB reads spike to **356/s** (a weaker echo follows as the re-cached — still identical-TTL — keys expire together again). This is the thundering herd the ladder predicted; T24 adds ±jitter to every `Set` (L1 + L2) and must flatten the spike into a smear. Latency does not move on this box (a PK read is sub-ms even under the burst) — the avalanche is a DB-load problem, not a tail-latency one, which is itself the lesson: pick the instrument (miss count) that matches the symptom.</sub>
+
+<sub>Rung 4c — T24 (avalanche cure: ±jitter). `jitteredTTL(base, pct)` (`internal/resilience/cache/jitter.go`, `math/rand/v2`) spreads the L2 `Set` TTL by ±`CACHE_TTL_JITTER_PCT` (default 10) at the single L2 write point (`valkeyCache.Set`), so burst-warmed keys no longer share one expiry instant. Re-ran the T23 scenario (same regime). **Dose-response** (peak DB reads/s · `dbsize` min): no jitter **356/s · 313** (1s cliff) → ±10% **250/s · 646** (~6s ramp) → ±50% **81/s · 926** (flat ~50/s hum, spike gone). The band is ±pct·TTL, so at the proof's short 20s TTL ±10% is only ±2s — partial smearing; at the production 300s TTL the same ±10% is a ±30s band (60s spread) and flattens completely. **Scope: L2 only** (confirmed). L1 (`expirable.LRU`) has a fixed construction-time TTL and ignores per-call ttl, so per-entry jitter would mean swapping the lib; and an L1-expiry wave falls through to the (now-jittered) L2 as an L2 *hit*, not a DB read — no DB herd — so the reproduced symptom is fully addressed at L2. Unit test `jitter_test.go` asserts the ±band + variation + no-op guards (pct=0, base=0→no expiry). Next symptom, T25: `singleflight` stampede (one hot key expiring mid-load → M duplicate DB reads).</sub>
+
+<sub>Rung 4c — T25 (stampede proof, no fix yet). New scenario `loadtest/cache_stampede.js` (`make load-cache-stampede`) points all load at a single hot key (`HOT_ID`) at 3000 rps with a short 5s TTL, so the run sees ~6–8 expiry cycles; the make target polls Valkey `keyspace_misses`/s. **This is a different failure from the avalanche and it survives the T24 jitter fix on purpose** — jitter desyncs expiry *across* keys, but one key still has a single expiry instant, and at that instant every concurrent in-flight request misses and runs its own DB read before the first `Set` repopulates the cache. Result: each cycle is a burst of **M = 58–63 duplicate DB reads for one logical value** (0 between, all hits), where an ideal cache does exactly 1 (the rest wait on it). Run L1 off (else L1 serves the hot key and hides the L2 stampede) and `DB_MAX_CONNS=1` (widens the repopulation window so the pileup is observable — on a healthy pool the window is sub-ms and M shrinks, the dual of insight #3/#8: the stampede is contention-gated too). p95 stays 3.3ms, 0 5xx — like the avalanche this is a wasted-DB-work problem, not a latency one. T26 collapses concurrent same-key misses with `golang.org/x/sync/singleflight` → exactly 1 DB read per expiry; re-run must flatten each burst to 1.</sub>
+
+<sub>Rung 4c — T26 (stampede cure: `singleflight`). `Service.Get` wraps the miss→`GetItem`→`Set` block in `s.sf.Do(key, …)` (`golang.org/x/sync/singleflight`, promoted from indirect): when a hot key expires, the first goroutine does the DB read + repopulate and all concurrent followers wait and share its result. Per-expiry DB reads **41 → 1** (peak), total **142 → 8** over the run (≈1 per expiry = ideal), 0 5xx, p95 flat at ~3.5ms. **Instrument correction — second occurrence of the T23 lesson.** The T25 proof polled Valkey `keyspace_misses`, which counts *cache* misses; singleflight collapses the *DB* reads **downstream** of the misses while the miss count is unchanged (every request still runs its own `cache.Get`). Measured at the cache, the fix looks like it does nothing (misses still ~350/run); measured at the DB (`pg_stat_user_tables.idx_scan` on `items`, one PK scan per `GetItem`) it's a 41→1 collapse. `loadtest/cache_stampede.js` + `make load-cache-stampede` now poll `idx_scan`, not `keyspace_misses` — measure the layer the symptom lives in. Deterministic regression: `TestSingleflight_CollapsesConcurrentMisses` (integration) uses a barrier cache that releases 50 callers simultaneously and asserts exactly one `Set` (= one DB load). Two ponytail caveats in the code: `Do` shares the leader's ctx (a cancelled leader fails its followers — fine for a sub-ms PK read; `DoChan` if the loader grows slow), and no in-closure cache re-check (singleflight already collapses the burst). **Ops gotcha:** the integration suite's `setupPool` `TRUNCATE`s `items`, destroying the 100k k6 seed — re-run `make load-seed N=100000` after `go test -tags=integration` before any cache k6 proof. Next symptom, T27: XFetch (probabilistic early recompute) — only if p99 still spikes at the TTL boundary after singleflight.</sub>
+
+<sub>Rung 4c — T27 (XFetch) **CLOSED — not earned, with the correct gate (DB read count).** Gate corrected from p99 to `idx_scan` per the 4c rule. Rewrote `cache_boundary.js` as a multi-key scenario mirroring the avalanche structure (warm 1000 keys → read across the TTL boundary) but with all shipping defences ON (jitter + singleflight), plus an `idx_scan` poller in `make load-cache-boundary`. **Measured boundary spike:** at 20s TTL / ±10% jitter = 1000 reads in ~6s, peak 194/s (structural: 1000 keys × 1 read/key, spread by jitter, each collapsed by singleflight). At 60s TTL = same reads in ~16s, peak 149/s. At production 300s TTL, ±10% jitter = ±30s (60s band) → ~17 reads/s — essentially flat. **XFetch was built, tested, and reverted.** The formula (`remaining < delta * beta * -ln(rand)`) requires `delta` (recompute duration) to be a meaningful fraction of the TTL. A sub-ms PK read (~200µs) against a 20s TTL gives `delta/remaining ≈ 0.00001` — the threshold is ~1667× too small to trigger before actual expiry. A prototype confirmed: XFetch ON produced an identical boundary spike (peak 296/s, total 2505 vs 2321 OFF — actually *more* reads from the wasted early-refresh attempts at t=2-3). **XFetch is designed for expensive recomputes (100ms+); for fast PK reads, jitter (T24) + singleflight (T26) are sufficient.** The boundary spike is a structural minimum (each key must refresh once) that jitter already distributes proportionally to TTL. Code reverted (~80 lines). Lesson: the correct gate reveals the correct answer — the boundary spike IS the jitter window, and the jitter window scales with TTL. At production TTL it's already flat.</sub>
 
 <sub>Rung 3: `make load RPS=100 DURATION=30s`, same 100k rows, single local instance. 7501 reqs, 0 failed, 100% checks. pgxpool wait measured indirectly — `server_repo_ms` (which wraps query + connection acquire via `TrackRepo`) held at p95=1ms identical to rung 2, so a 10× load increase added no acquire latency. `DB_MAX_CONNS` left at the 48 default (4×NumCPU=12); no index or pool change earned. Target p95 < 30ms met. Local-box headroom for higher rungs documented in `docs/local-tuning.md`.</sub>
 
 <sub>Rung 1 run: `k6 run loadtest/load.js -e RPS=1 -e DURATION=30s --summary-trend-stats="avg,min,med,p(90),p(95),p(99),max"`, local single instance + local Postgres, `OTEL_ENABLED`/`APILOG` not yet built. 75 reqs, 0 failed, all envelope/request_id checks passed. Per-layer from `Server-Timing`: `service`/`repo` p99=2ms. Target p95 < 10ms met. Note: k6's default summary omits p99 — pass `--summary-trend-stats` (or set `summaryTrendStats` in options) to capture it.</sub>
+
+---
+
+## T29 — two-machine cloud ladder (AWS, c6i.2xlarge)
+
+Two `c6i.2xlarge` (8 vCPU, 16 GB) on the same VPC/AZ (ap-south-1), sub-ms
+network RTT. `DB_MAX_CONNS=16` (2×CPU), all cache tiers on, bloom on, 100k seed.
+
+| Role | Instance | Private IP | Specs |
+|---|---|---|---|
+| API + Postgres (Docker) + Valkey (Docker) | `c6i.2xlarge` | 172.31.22.54 | 8 vCPU, 16 GB, Amazon Linux 2023, Go 1.24 |
+| k6 load generator | `c6i.2xlarge` | 172.31.17.152 | 8 vCPU, 16 GB, Amazon Linux 2023, k6 v0.56 |
+
+### WiFi attempt (failed, for the record)
+
+Two local machines over WiFi (192.168.1.x). Hit the WiFi router's connection-
+tracking limit at ~5K rps — `connection forcibly closed` / `dial tcp: connectex`
+floods starting at ~8K VUs. Server was fine (`server_handler_ms` p95=3ms); the
+router was the bottleneck. Not a valid server measurement.
+
+### Cloud ladder — warm cache
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | dropped/s | repo p95 | VUs used |
+|---|---|---|---|---|---|---|---|---|---|
+| 5,000 | 8,332 | 0.42ms | 0.66ms | 1.12ms | 58ms | 0% | 0 | 0ms | 5–10 |
+| 10,000 | 16,665 | 3.7ms | 108ms | 120ms | 222ms | 0% | 0 | 104ms | 200–1335 |
+| 15,000 | 19,035 | 159ms | **931ms** ❌ | 1.13s | 1.47s | 0% | 2977 | 747ms | 2000–11,064 |
+
+### Cloud — cold cache at 10K rps
+
+Server restarted, Valkey flushed, L1 empty, bloom rebuilt from DB at boot.
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | dropped/s | repo p95 |
+|---|---|---|---|---|---|---|---|---|
+| 10,000 | 16,664 | 5.31ms | 113ms | 127ms | 226ms | 0% | 0 | 107ms |
+
+Cold start ≈ warm: the ramp (0→10K over ~10s) warms L1/L2 before RPS peaks. Bloom builds at boot from `SELECT id FROM items` (100k rows, <100ms). No cold-start penalty.
+
+### Ceiling analysis — why 15K breaks
+
+The bottleneck is the **`/items` list endpoint** hitting Postgres on every request (not cached). At 15K target rps, the `load.js` mix sends ~50% list requests = ~7.5K list/s through a 16-conn pool. `server_repo_ms` p95 jumped from 104ms (10K) to **747ms** (15K) — pure pool-queueing: 7.5K req/s ÷ 16 conns = ~470 concurrent-per-conn at Little's law, far above what 16 connections can serve without queueing.
+
+The cached `GET /items/:id` is still sub-ms at 15K (median 0ms) — the cache tier is not the bottleneck. The problem is that **list is un-cacheable in the current design** (it's paginated, dynamic, and always hits the DB).
+
+### What would fix 15K
+
+1. **Cache the list endpoint** — short-TTL cache of the first few pages (hot pages). Most list traffic hits page 1. A 5s TTL serves ~37,500 page-1 requests from cache per cycle. Biggest single win.
+2. **Increase DB_MAX_CONNS** — 16→32 doubles pool capacity. But this is a band-aid; the list query still scales linearly with RPS.
+3. **Separate Postgres onto its own instance** — gives the DB dedicated CPU/RAM. The shared instance makes Go, Valkey, and Postgres compete for the same 8 vCPUs.
+4. **Read replicas** — route list queries to a read replica. Unlimited horizontal read scale.
+5. **Connection pooler (PgBouncer)** — multiplex 1000s of goroutine connections through 32 real Postgres connections. Eliminates the conn-limit ceiling.
+
+The lazy fix is #1 (cache list page 1) — it's the same cache-aside pattern already proven for single-item reads, and it eliminates ~80% of the DB-bound list traffic.
+
+---
+
+## Full ladder — current code (all optimizations on)
+
+### Local single-box (12 cores, `DB_MAX_CONNS=48`)
+
+Snapshot of the finished rung-4 code with everything enabled: cache-aside on
+(Valkey up), `reltuples` count, partial index, and a realistic `DB_MAX_CONNS=48`
+(4×12 cores). `make load RPS=<n> VUS=200 DURATION=20s`, mixed `load.js`
+(cached `GET /items/:id` + DB-backed list), single box.
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | repo p95 |
+|---|---|---|---|---|---|---|---|
+| 1    | 1.7   | 1.57ms | 3.93ms | 5.64ms | 6.0ms | 0% | 2ms |
+| 10   | 15.7  | 1.45ms | 2.63ms | 3.65ms | 10.6ms | 0% | 1ms |
+| 100  | 157   | 1.17ms | 2.28ms | 2.95ms | 12.0ms | 0% | 1ms |
+| 1000 | 1570  | 1.22ms | 3.24ms | 7.37ms | 27.4ms | 0% | 1ms |
+| 2000 | 3142  | 1.46ms | 8.92ms | 16.23ms | 72.0ms | 0% | 4ms |
+| 5000 | 4767  | 55.5ms | 291.6ms | 341ms | 608ms | 0% (1542 dropped/s) | 256ms |
+
+### Cloud two-machine (c6i.2xlarge, `DB_MAX_CONNS=16`)
+
+| RPS (target) | achieved rps | p50 | p95 | p99 | max | err% | repo p95 |
+|---|---|---|---|---|---|---|---|
+| 5,000 | 8,332 | 0.42ms | 0.66ms | 1.12ms | 58ms | 0% | 0ms |
+| 10,000 | 16,665 | 3.7ms | 108ms | 120ms | 222ms | 0% | 104ms |
+| 15,000 | 19,035 | 159ms | 931ms ❌ | 1.13s | 1.47s | 0% | 747ms |
+
+## Insights
+
+1. **Flat p95 (≤ 4ms) from 1 → 1000 rps.** Latency is independent of load across
+   three orders of magnitude — the box is nowhere near saturation. This is the
+   signature of a correct stateless design: throughput scales with no latency
+   cost until a real resource binds. Confirms the ROADMAP claim "1→1K needs no
+   infra change."
+
+2. **The bottleneck was never the index — it was query design.** Rung 2's 20.68ms
+   p95 came from an exact `count(*)` scanning 100k rows every list call. No index
+   fixes a count where the predicate matches ~all rows; the O(1) `reltuples`
+   estimate did (p95 → 3ms). Biggest lesson: profile the *query plan*, don't
+   reflexively add indexes.
+
+3. **Cache value is conditional on DB contention, not on raw RPS.** At a healthy
+   `DB_MAX_CONNS=48` the cache barely matters up to 2000 rps (DB isn't the
+   bottleneck). Its 60× win (278ms → 4.6ms) only appears once the pool is the
+   scarce resource (`DB_MAX_CONNS=1`, simulating a shared/pgbouncer-capped
+   Postgres at 10K+). Cache-aside buys *DB-independence*, not blanket speed —
+   earn it where the DB actually binds.
+
+4. **`repo_ms` is the leading indicator.** Every rung's p95 tracked `repo_ms`
+   (query + connection-acquire time). It stayed at 1ms through 1000 rps, ticked to
+   4ms at 2000, and blew to 256ms at 5000 — the single cleanest signal of where
+   the real work (and the queueing) is. Per-layer timing (rung 1) paid for itself.
+
+5. **The 5000-rps cliff is the test rig, not the service.** p95 jumps to 292ms
+   with 1542 dropped iterations/s because k6 + server + Postgres + Valkey share 12
+   cores. It's CPU/load-gen exhaustion, exactly what `docs/local-tuning.md`
+   predicts above ~5K. Any "server fails at 5K" claim from a single box is
+   measuring the laptop — real 10K needs two-machine k6 (T29) / cloud.
+
+6. **Fail-open held under load.** With Valkey stopped mid-regime, every cache op
+   degraded to a DB read with **0 5xx** — availability never depended on the
+   cache. Resilience is a measured property here, not an assumption.
+
+7. **Every win was earned by a reproduced failure first.** Rungs 1 and 3 added
+   no code because no benchmark justified it; rungs 2 and 4 changed code only
+   after a red run proved the need. The ladder kept the diff small and the
+   complexity paid-for.
+
+8. **Resilience wins are contention-gated too — and the regime you test in
+   decides what you see.** The rung-4b tiered cache shows 294× at
+   `DB_MAX_CONNS=1` but ~1ms either way at `DB_MAX_CONNS=48`: a Valkey outage is
+   a crisis only when the DB pool is already the scarce resource. Same code, two
+   verdicts. Two corollaries bit here: (a) the per-request **dial tax** to a dead
+   Valkey (3577ms/cold read) is hidden by concurrent load and by a slow DB queue —
+   you only see it in a single-request micro-test; (b) an integer-ms timing header
+   silently **undercounts sub-ms DB reads**, so a flood metric that works at 1 conn
+   lies at 48. Pick the failure regime deliberately, and confirm your instrument
+   has the resolution for it.
+
+9. **Measure the layer the symptom lives in — this bit three times.** The cache
+   failures (T23–T26) are DB-*work* problems, invisible in p95 (sub-ms PK reads
+   never move the tail). Each needed a count metric at the right layer, and the
+   obvious instrument was wrong twice: (a) `Server-Timing repo_ms` is integer-ms →
+   rounds sub-ms reads to 0 (blind to the avalanche herd); (b) Valkey
+   `keyspace_misses` counts *cache* misses, which `singleflight` leaves unchanged
+   while it collapses the *DB* reads downstream — so the stampede fix looks like a
+   no-op at the cache (misses ~350/run either way) and a 41→1 collapse at the DB
+   (`pg_stat_user_tables.idx_scan`). Rule: name the exact quantity the failure
+   moves — DB read *count*, not request latency, not cache misses — and read it off
+   the layer that quantity lives on. A fix that's invisible in your dashboard is
+   usually a dashboard pointed at the wrong layer, not a fix that did nothing.
+
+10. **Jitter and singleflight are orthogonal stampede defenses — don't conflate
+    them.** Both attack cache-expiry thundering herds, on different axes: TTL jitter
+    (T24) desyncs expiry *across many keys* (fixes the avalanche); `singleflight`
+    (T26) collapses concurrent misses *on one key* (fixes the dogpile). A single
+    hot key defeats jitter entirely — it still has one expiry instant — which is
+    why T25 reproduced a 41–63× pileup *with jitter already on*. One technique is
+    not a substitute for the other; each was earned by its own reproduced failure,
+    and a cache serving both a broad working set and a few hot keys needs both.
+
+11. **Cache penetration is a different class of failure: absent keys, not expiring
+    keys.** Avalanche (T23), stampede (T25), and L1/breaker (T22a/b) all assume
+    the requested id *exists* — they protect cache *refresh*. Penetration is a
+    flood of ids that *never* existed: nothing ever caches a hit, singleflight
+    can't collapse distinct keys, and L1/L2 are inert. The DB absorbs 100% of the
+    flood — **43,867 index scans in 30s (≈ served requests), peak 3,054/s** —
+    scaling 1:1 with attacker RPS. An in-process bloom pre-filter (`MayExist` = a
+    handful of hash + bit-test ops, zero alloc) answers "this id cannot exist"
+    before any cache or DB touch: DB reads **→ 0** (total and peak), p95 369ms →
+    3.5ms. The bloom's false positives (gap ids inside the range) fall through to
+    the DB once; a negative-cache tombstone (`[]byte{0}`, 30s TTL) absorbs repeats.
+
+12. **Latency can mask a real problem — measure the resource the attack amplifies,
+    not the symptom the pool absorbs.** At `DB_MAX_CONNS=48` the penetration flood
+    shows p95 **27ms** (well inside budget) — latency looks fine, dashboard green.
+    But the DB still ate **87,685 wasted index scans** in 30s, peak 4,398/s. A
+    healthy pool hides the latency; it does not hide the work. The correct success
+    metric for penetration is `idx_scan delta → ~0`, not `p95 < budget`. If you
+    only watch latency, you see the problem when the pool is contended — i.e. when
+    it's already an incident. Generalizes insight #9: pick the metric that matches
+    the *resource* under attack (DB read count), not the *user-visible symptom*
+    (tail latency).
+
+13. **XFetch requires `delta ≈ TTL` to work — it's a tool for expensive recomputes,
+    not fast reads.** The XFetch formula (`remaining < delta * beta * -ln(rand)`)
+    is driven by `delta` (recompute duration). A sub-ms PK read (~200µs) against a
+    20s TTL gives `delta/TTL ≈ 0.00001` — the probabilistic threshold is ~1667×
+    too small to trigger before actual expiry. XFetch was built, tested, and
+    confirmed to be a no-op (identical boundary spike, actually slightly worse from
+    wasted early-refresh overhead). **The correct answer was already in place:**
+    jitter (T24) spreads the 1000-key boundary across a window proportional to TTL
+    (±10% of 300s = 60s → ~17 reads/s), and singleflight (T26) collapses each key
+    to 1 read. At production TTL the boundary is already flat. The wrong gate (p99)
+    deferred T27; the correct gate (idx_scan) closed it. Revisit XFetch only if the
+    recompute becomes expensive (aggregation, join, slow query).
+
+14. **L1 is the hot-key defence by construction — key-splitting is for architectures
+    without an in-process tier.** A single hot key at 3000 rps with L1 on produced
+    **2 DB reads and 5 Valkey ops** over 30s — 89,993/90,000 requests served from a
+    map lookup in process memory. The premise of T28a (Valkey connection saturation)
+    cannot reproduce because L1 intercepts before L2. Key-splitting fans one key into
+    N sub-keys across Valkey shards, but that technique addresses L2-level load that
+    L1 has already eliminated. Revisit only in a multi-shard, L2-only architecture
+    (rung-6 T62) where there is no in-process tier to absorb the hot key.
+
+15. **WiFi is not a load-testing network.** 8000 VUs over a consumer WiFi router
+    saturated the router's NAT table / connection tracking before the server noticed.
+    `server_handler_ms` p95 = 3ms while k6 reported p95 = 220ms — pure network, not
+    server. Two machines on the same WiFi cannot produce a clean test above ~5K rps.
+    Same machines on an AWS VPC (sub-ms RTT) delivered 10K rps at p95 = 108ms. The
+    test rig is always in the measurement; WiFi puts a ~5K ceiling on it.
+
+16. **The ceiling at 15K is the un-cached list endpoint, not the cached read.** At
+    15K rps, `GET /items/:id` (cached) stays at median 0ms — the L1→L2→DB tiered
+    cache, bloom, and singleflight are all working. The bottleneck is `GET /items`
+    (paginated list): every request hits Postgres, no caching. 50% of `load.js`
+    traffic is list = ~7.5K list/s through 16 DB conns → pool queueing → `repo_ms`
+    p95 jumps from 104ms (10K) to 747ms (15K). **The next rung's fix is caching the
+    list endpoint** (short-TTL on hot pages) or scaling the DB tier (read replicas,
+    PgBouncer, separate instance). The single-item cache path has no observable
+    ceiling at this load.
+
+17. **Cold cache is a non-event at ramp-up load patterns.** Cold-cache 10K rps
+    (Valkey flushed, server restarted, L1 empty) produced p95 = 113ms ≈ warm p95 =
+    108ms. The ramp (0→10K over ~10s) warms L1/L2 from the first requests; by peak
+    RPS the working set is cached. The bloom rebuilds from `SELECT id FROM items`
+    at boot (<100ms for 100k rows). Cold-start matters only under instant-spike
+    scenarios (0→10K in <1s) — the ramp pattern used by `load.js` hides it. A spike
+    test (`spike.js`) with a cold cache would expose it if needed.

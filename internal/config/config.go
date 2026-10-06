@@ -52,6 +52,50 @@ type Config struct {
 	// An empty string disables Valkey and activates in-memory fallbacks.
 	ValkeyURL string `env:"VALKEY_URL" envDefault:"redis://localhost:6379/0"`
 
+	// CacheItemTTLS is the cache-aside TTL for single-item reads, in seconds.
+	CacheItemTTLS int `env:"CACHE_ITEM_TTL_S" envDefault:"300"`
+
+	// CacheL1Enabled fronts Valkey (L2) with a bounded in-process L1 tier
+	// (L1 → L2 → DB) so a Valkey outage does not flood the DB (NFR-R5).
+	CacheL1Enabled bool `env:"CACHE_L1_ENABLED" envDefault:"true"`
+
+	// CacheL1Max bounds L1 entries (LRU eviction) so it cannot OOM on an outage.
+	CacheL1Max int `env:"CACHE_L1_MAX" envDefault:"10000"`
+
+	// CacheL1TTLS is the short L1 TTL in seconds (L1 may serve slightly stale).
+	CacheL1TTLS int `env:"CACHE_L1_TTL_S" envDefault:"30"`
+
+	// CacheTTLJitterPct spreads the L2 (Valkey) Set TTL by ±pct so a burst-warmed
+	// working set does not all expire in one instant (cache avalanche, T24).
+	CacheTTLJitterPct int `env:"CACHE_TTL_JITTER_PCT" envDefault:"10"`
+
+	// CacheBreakerFailThreshold is the number of Valkey failures before the cache
+	// breaker OPENs (skips Valkey, no per-request dial tax).
+	CacheBreakerFailThreshold int `env:"CACHE_BREAKER_FAIL_THRESHOLD" envDefault:"5"`
+
+	// CacheBreakerRecoveryS is the cache breaker OPEN→HALF_OPEN probe interval in
+	// seconds (self-heal when Valkey returns).
+	CacheBreakerRecoveryS int `env:"CACHE_BREAKER_RECOVERY_S" envDefault:"10"`
+
+	// CacheBloomEnabled fronts the hot read with an in-process bloom filter of
+	// existing item ids. A flood of absent ids (cache penetration, T28) is answered
+	// in-process — "this id cannot exist" short-circuits to 404 before any DB touch,
+	// so the DB read rate stays flat instead of tracking attacker RPS 1:1.
+	CacheBloomEnabled bool `env:"CACHE_BLOOM_ENABLED" envDefault:"true"`
+
+	// CacheBloomCapacity sizes the bloom for the expected id count at the target
+	// false-positive rate. The table may grow past this; FP degrades gracefully
+	// (a false positive just falls through to the DB, which answers correctly).
+	CacheBloomCapacity int `env:"CACHE_BLOOM_CAPACITY" envDefault:"1000000"`
+
+	// CacheBloomFPRate is the bloom's target false-positive probability.
+	CacheBloomFPRate float64 `env:"CACHE_BLOOM_FP_RATE" envDefault:"0.01"`
+
+	// CacheNegTTLS is the negative-cache (tombstone) TTL in seconds: how long a
+	// confirmed-absent id is remembered so a repeated bad id (one that passed the
+	// bloom as a false positive) does not re-hit the DB. Kept short.
+	CacheNegTTLS int `env:"CACHE_NEG_TTL_S" envDefault:"30"`
+
 	// -------------------------------------------------------------------------
 	// Logging
 	// -------------------------------------------------------------------------

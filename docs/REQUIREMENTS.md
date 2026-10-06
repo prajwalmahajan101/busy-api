@@ -29,6 +29,7 @@ truth for **what** the system must do and the constraints it must meet.
 | F-4 | Soft-delete (`is_active=false`) is the default delete; hard delete explicit only. |
 | F-5 | Errors map to a typed hierarchy → correct HTTP status + error envelope (see §8). |
 | F-6 | Hot reads may be served cache-aside from Valkey; cache is fail-open (Valkey down ⇒ serve from DB, never 5xx). |
+| F-11 | The cache is **tiered and self-healing**: a bounded in-process L1 fronts Valkey (L1 → L2 Valkey → DB) so a Valkey outage does not flood the DB; a circuit breaker around Valkey stops dialing a down backend and auto-recovers. Hardened against avalanche (TTL jitter), stampede (`singleflight`/XFetch), penetration (bloom filter), and hot keys (key-splitting), each proven by a reproduced k6 failure. |
 | F-7 | Outbound calls to upstreams go through a pooled client with per-call auth, error mapping, SSRF guard, and resilience wrapping. |
 | F-8 | Every inbound request is audit-logged asynchronously (method, url, status, duration, sizes, error, request_id) without blocking the response. |
 | F-9 | `/health` (liveness) and `/ready` (readiness: Postgres + Valkey) endpoints. |
@@ -52,6 +53,7 @@ truth for **what** the system must do and the constraints it must meet.
 - **NFR-R2:** Circuit breaker trips only on **transient/timeout** errors (5xx, network, timeout); never on business 4xx or an upstream 4xx rejection (`ExternalServiceError`) — a 4xx means the upstream is healthy and rejected our request, so retrying/tripping would be wrong.
 - **NFR-R3:** Graceful shutdown on SIGINT/SIGTERM: stop accepting → drain in-flight → flush audit buffer → flush telemetry → close pools.
 - **NFR-R4:** Audit buffer is bounded; overflow drops records (counted), never blocks or OOMs.
+- **NFR-R5:** The cache is self-healing: a circuit breaker around Valkey OPENs after repeated failures so a down/slow Valkey is **skipped** (no per-request dial tax) rather than dialed every call, and HALF_OPEN probes auto-recover when Valkey returns. A bounded in-process L1 tier absorbs reads during the outage so DB load stays flat; L1 is capped (`CACHE_L1_MAX`) and cannot OOM.
 
 ### 4.4 Security
 - **NFR-SEC1:** Validate at boundaries; parameterized queries only (sqlc); no string-built SQL.
@@ -160,6 +162,14 @@ Unknown errors → 500 generic envelope (no internal detail leaked).
 | `DB_CONN_TIMEOUT_MS` | no | `5000` | pgxpool connect timeout |
 | `DB_QUERY_TIMEOUT_MS` | no | `2000` | per-call query deadline (`context.WithTimeout` on every DB call) |
 | `VALKEY_URL` | no | `redis://localhost:6379/0` | empty ⇒ in-memory fallback |
+| `CACHE_ITEM_TTL_S` | no | `300` | cache-aside TTL for single-item reads (seconds) |
+| `CACHE_L1_ENABLED` | no | `true` | in-process L1 tier in front of Valkey (L1→L2→DB) |
+| `CACHE_L1_MAX` | no | `10000` | bounded L1 entries (LRU) — cannot OOM on Valkey outage |
+| `CACHE_L1_TTL_S` | no | `30` | short L1 TTL |
+| `CACHE_BREAKER_FAIL_THRESHOLD` | no | `5` | Valkey failures before the cache breaker OPENs |
+| `CACHE_BREAKER_RECOVERY_S` | no | `10` | cache breaker OPEN→HALF_OPEN probe interval |
+| `CACHE_TTL_JITTER_PCT` | no | `10` | ±% jitter on every cache Set TTL (avalanche fix) |
+| `CACHE_HOTKEY_SPLITS` | no | `1` | replica sub-keys per hot key (`>1` enables splitting) |
 | `LOG_LEVEL` | no | `INFO` | DEBUG/INFO/WARNING/ERROR |
 | `LOG_JSON` | no | `true` | text if false |
 | `LOG_FILE` | no | `` | path ⇒ rotate+gzip |
