@@ -64,12 +64,23 @@ var tombstone = []byte{0}
 // cache would be stale for up to the L1 TTL after a bump — defeating invalidation.
 const itemsVerKey = "items:listver"
 
+// listVerCacheTTL bounds how long a List may use an in-process-cached version
+// before re-reading Valkey. Without it, every List does a synchronous Valkey GET
+// for the version — at 15K+ rps that round-trip (relayed by docker-proxy in the
+// cloud test) dominated CPU and inflated service_ms while repo_ms stayed 0. A 1s
+// cache collapses ~10K version GETs/s to ~1/s. Cost: a write on another instance
+// is visible within 1s (same-instance writes are immediate — bumpVersion refreshes
+// the local cache). Single-instance deployments see no staleness at all.
+const listVerCacheTTL = time.Second
+
 // Service is the business layer over the sqlc store. Every call runs under the
 // DB query timeout
 type Service struct {
 	q        *storedb.Queries
 	rdb      *redis.Client // raw client for the list-cache version counter; nil ⇒ atomic fallback
 	ver      atomic.Int64  // in-process version, used when rdb is nil (single-instance)
+	verVal   atomic.Int64  // last version read from Valkey (in-process cache, listVerCacheTTL)
+	verAt    atomic.Int64  // unixnano of that read; 0 = never read
 	cache    cache.Cache
 	cacheTTL time.Duration
 	negTTL   time.Duration      // negative-cache (tombstone) TTL for absent ids (T28)
@@ -92,24 +103,37 @@ func listCacheKey(ver int64, page, size int) string {
 	return fmt.Sprintf("items:list:%d:%d:%d", ver, page, size)
 }
 
-// listVersion returns the current list-cache version. Reads INCR-maintained
-// counter from Valkey (bypassing the cache tiers so a bump is seen immediately);
-// on a nil client or any error it falls back to the in-process counter. Fully
-// fail-open — a version read never fails a List.
+// listVersion returns the current list-cache version. It serves from an in-process
+// cache for listVerCacheTTL to avoid a Valkey GET on every List; past the TTL it
+// re-reads the INCR-maintained counter from Valkey (bypassing the cache tiers so a
+// bump is seen promptly). On a nil client or any error it falls back to the
+// in-process counter / last cached value. Fully fail-open — a version read never
+// fails a List.
 func (s *Service) listVersion(ctx context.Context) int64 {
 	if s.rdb == nil {
 		return s.ver.Load()
 	}
+	now := time.Now().UnixNano()
+	if at := s.verAt.Load(); at != 0 && now-at < int64(listVerCacheTTL) {
+		return s.verVal.Load()
+	}
 	v, err := s.rdb.Get(ctx, itemsVerKey).Int64()
 	if err != nil {
-		return s.ver.Load() // miss (key absent) or outage ⇒ sentinel; List still serves
+		if s.verAt.Load() != 0 {
+			return s.verVal.Load() // outage ⇒ serve the last known version
+		}
+		return s.ver.Load() // never read + key absent ⇒ sentinel; List still serves
 	}
+	s.verVal.Store(v)
+	s.verAt.Store(now)
 	return v
 }
 
 // bumpVersion advances the list-cache version so every pre-write list key orphans
 // (they expire by TTL — no scan/delete). INCR on Valkey when present, else the
-// in-process counter. Fail-open: a bump failure never fails the write.
+// in-process counter. The new value is written into the in-process version cache
+// so this instance sees its own write immediately (read-your-write within the
+// listVerCacheTTL window). Fail-open: a bump failure never fails the write.
 //
 // ponytail: cross-instance invalidation needs Valkey — with rdb nil the atomic is
 // local, so a write on one instance will not invalidate another's list cache.
@@ -118,9 +142,13 @@ func (s *Service) bumpVersion(ctx context.Context) {
 		s.ver.Add(1)
 		return
 	}
-	if err := s.rdb.Incr(ctx, itemsVerKey).Err(); err != nil {
+	v, err := s.rdb.Incr(ctx, itemsVerKey).Result()
+	if err != nil {
 		s.ver.Add(1) // outage ⇒ advance the local counter so this instance still invalidates
+		return
 	}
+	s.verVal.Store(v)
+	s.verAt.Store(time.Now().UnixNano())
 }
 
 func (s *Service) Create(ctx context.Context, notes []byte) (storedb.Item, error) {
