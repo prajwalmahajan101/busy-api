@@ -14,10 +14,6 @@ SELECT count(*) FROM items
 WHERE is_active = true
 `
 
-// Exact count. NOT used on the list hot path — count(*) WHERE is_active=true
-// Seq-Scans the whole table (~all rows active) and no index fixes it, so the list
-// endpoint uses store.CountItemsEstimate (reltuples) instead. Kept for callers
-// that need an exact count off the hot path.
 func (q *Queries) CountItems(ctx context.Context) (int64, error) {
 	row := q.db.QueryRow(ctx, countItems)
 	var count int64

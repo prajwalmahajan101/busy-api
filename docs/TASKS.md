@@ -19,8 +19,8 @@ first and the fix second.
 | 2 | 10 rps | indexes | M3 |
 | 3 | 100 rps | pool tuning | M3 |
 | 4 | 1K rps | cache-aside + tiered L1/self-healing + cache hardening | M4 |
-| 5 | 10K rps | horizontal + observability + throttle + audit + lifecycle | M5 |
-| 6 | 100K rps | shard + CDN + audit queue sink | M6 |
+| 5 | 10K→15K→30K→50K→75K→100K | list cache + exact count, then incremental scaling (each step earned) | M5 |
+| 6 | 100K+ | shard + CDN + audit queue sink (if 100K ceiling hit) | M6 |
 | — | n/a | outbound resilience (breaker/retry/httpclient) — consumer-driven | — |
 
 Success at each rung = under its p95 budget, < 1% errors. If a 10× jump breaks,
@@ -130,6 +130,18 @@ Each: k6 scenario proving the failure first, then the cure. Before/after in logb
 
 > Trigger: rung 4 passes AND a read replica or second instance is needed. No cloud before both true (R24).
 
+### 5.0 List cache — DONE (closes the T29 15K ceiling; ADR 0008)
+
+Added after T29 found the un-cached `/items` list saturating the 16-conn pool at 15K.
+
+- [x] T-L1. Cache-aside + singleflight on `Service.List` over the tiered cache; exact `count(*)` replaces the `reltuples` estimate (cache absorbs the cost); delete `CountItemsEstimate`/`RowQuerier`/dead `pool` field.
+- [x] T-L2. Version-key invalidation: key `items:list:<ver>:<page>:<size>`, `Create`/`SoftDelete`/`Delete` `INCR` a raw-Valkey version counter (not through `cache.Cache` — L1 would stale it); in-process `atomic` fallback when Valkey off; fail-open. Regression `TestListVersionInvalidation_Integration`.
+- [x] T-L3. In-process 1s memo on the version `GET` (it became the per-request hot path at 15K+ via docker-proxy; cloud `handler_ms` 52ms → 0).
+- [x] T-L4. List avalanche: `loadtest/cache_list_avalanche.js` + `make load-cache-list-avalanche`; cure is `CACHE_TTL_JITTER_PCT` (XFetch built + rejected, logbook insight #18).
+- [x] T-L5. Cloud retest (2× c6i.2xlarge, DB_MAX_CONNS=16, 100k seed): **15K repo_ms 747ms → 0, clean p95 7.39ms** (≈126× over T29). Server ceiling found: **~33K req/s, app-CPU-bound, Postgres 0% / Valkey ~0%** → next rung is horizontal (ADR 0008). `loadtest/ceiling.js` + `make load-ceiling` for the lightened generator.
+
+**Rung-5 throughput target (M5 exit, p95 < 100ms @ 10K) met: 10K @ p95 7.3ms.** The DB/cache bottleneck is gone; the read path is now CPU-bound. Remaining M5 tasks (throttle / audit / observability / lifecycle / cloud deploy) below are unbuilt.
+
 ### 5a. Rate-limit throttle (edge hardening)
 
 - [ ] T30. Re-introduce `internal/resilience/throttle` (sliding window, Valkey + in-memory) from `phase5-built`; **bound the in-memory per-IP map (TTL eviction / capped LRU)** so Valkey-down cannot leak memory (fixes review ISSUE-002); wire per-route → 429 + `X-RateLimit-*`; integration test: limit exceeded → 429 + headers; Valkey down → fallback holds (R10, F-10, NFR-P4).
@@ -182,7 +194,7 @@ Each: k6 scenario proving the failure first, then the cure. Before/after in logb
 
 > Only after M5 validated and 10K data in hand.
 
-- [ ] T59. Evaluate distributed-DB choice from rung-5 access patterns (Citus / CockroachDB / read-replica fan-out + CDN edge); write `docs/adr/0007-rung6-db-strategy.md`.
+- [ ] T59. Evaluate distributed-DB choice from rung-5 access patterns (Citus / CockroachDB / read-replica fan-out + CDN edge); write `docs/adr/0009-rung6-db-strategy.md`.
 - [ ] T60. Implement the chosen DB strategy; validate with 20–50 replicas + LB.
 - [ ] T61. Implement the real `queue` sink (Kafka/NATS) and switch `APILOG_SINK=queue` so Postgres audit does not saturate at this scale (R8).
 - [ ] T62. **Hot-key protection at shard scale** — extends rung-4 T28a (L1 + key-splitting) to a real multi-shard Valkey: reproduce one shard CPU-bound on one key, then prove splitting + L1 spreads it across shards.
@@ -211,3 +223,5 @@ Each: k6 scenario proving the failure first, then the cure. Before/after in logb
 - [ ] `0005-api-audit-log.md`
 - [ ] `0006-observability.md`
 - [x] `0007-cache-hardening.md` — tiered L1→L2→DB + self-healing Valkey breaker (T22a/T22b landed); TTL jitter / singleflight / XFetch / bloom / hot-key split remain future rows, each earned by a reproduced failure.
+- [x] `0008-rung5-list-cache-and-horizontal-scaling.md` — list cache + version-key invalidation closes the T29 15K ceiling; read path now app-CPU-bound at ~33K req/s → rung 6 is horizontal (externalize PG/Valkey, version counter already shared).
+- [ ] `0009-rung6-db-strategy.md` — read replicas / PgBouncer / sharding, decided from rung-5 data (was 0007 placeholder in rung 6 below).

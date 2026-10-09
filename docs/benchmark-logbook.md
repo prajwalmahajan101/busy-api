@@ -53,6 +53,9 @@ attributable per layer from the client side, not just in server logs.
 | 4c-T28 (before) | 2026-10-05 | 3000 rps target, every request a **fresh random absent id** (`100M+rand`, seed is ids 2–100001), bloom off, L1 off, `DB_MAX_CONNS=1` | 263.6ms | 369ms | 409.7ms | 100%† | **penetration reproduced** — no id ever resolves, so nothing caches a hit and no two requests share a key (singleflight/L1/L2 all inert). Every request falls through to `GetItem` → `ErrNoRows` → one PK index scan: **total DB reads = 43,867 ≈ served requests (44,205); peak db_reads/s = 3,054 tracks RPS 1:1**. The 1-conn pool saturates → p95 **369ms** (1.8× the 200ms budget), actual throughput throttled to ~1.46k rps (45.8k iters dropped). †100% `http_req_failed` = all 404 by design (not errors). At `DB_MAX_CONNS=48` latency is fine (p95 27ms) but the DB still eats 100% of the flood (**87,685 scans / 30s, peak 4,398/s**) — the problem is sustained wasted DB work, not tail latency | — (bloom pre-filter + negative cache) |
 | 4c-T28 (after)  | 2026-10-05 | same regime, `CACHE_BLOOM_ENABLED=true` (default), `DB_MAX_CONNS=1` | 0.47ms | 3.48ms | 14.3ms | 100%† | — | In-process bloom pre-filter (`bits-and-blooms/bloom/v3`) + negative-cache tombstone on `ErrNoRows`. **DB reads 43,867 → 0** (total), **3,054/s → 0/s** (peak). Every absent id is answered in-process before any cache or DB touch. p95 **369ms → 3.5ms** (latency is a side effect of not touching the pool at all). Full 3k rps served (0 dropped vs 45.8k dropped). Negative-cache tombstone covers the bloom's false positives (gap ids that pass the filter reach the DB once, then are cached as absent for `CACHE_NEG_TTL_S=30`). Tests: `TestPresence_NoFalseNegatives`, `TestBloomShortCircuit_Integration`, `TestNegativeCache_Integration` |
 | 4c-T28a | 2026-10-05 | 3000 rps single hot key (`HOT_ID=2`), **L1 ON** (shipping config), `CACHE_ITEM_TTL_S=300`, `DB_MAX_CONNS=1` | 0.60ms | 1.54ms | 6.04ms | 0.00% | **not earned** — L1 absorbs the hot key entirely in-process: **db_reads = 2** (initial fill + 1 L1-TTL re-read), **valkey_hits = 5** (initial fill only), 89,993/90,000 requests served from L1 (map lookup, no network). The hot-key Valkey-saturation failure mode cannot reproduce with L1 on — there is no Valkey connection to saturate. Key-splitting is for a multi-shard L2-only architecture where no L1 exists | — (not needed) |
+| 5 (list cache) | 2026-10-07 | 500 rps, 500 list pages, `CACHE_ITEM_TTL_S=20`, L1 off, `DB_MAX_CONNS=48`, 600k rows | 1.22ms | 53.73ms | 1.96s | 0.69% | cache-aside + singleflight on `Service.List`, versioned key `items:list:<ver>:<page>:<size>` (version-key invalidation on write — see note), same TTL/jitter as single-item reads. Exact `count(*)` replaces `reltuples` estimate (accuracy over O(1) — the cache absorbs the cost). `CountItemsEstimate` + `RowQuerier` deleted | cache-aside + singleflight + version invalidation |
+| 5 (list avalanche, before — jitter 10%) | 2026-10-07 | 500 rps, 500 pages warmed in burst, `CACHE_ITEM_TTL_S=20`, L1 off, `DB_MAX_CONNS=48`, ±10% jitter | — | — | — | 0% | **list avalanche reproduced** — 500 pages warmed in ~5s share near-identical TTL. Steady state between boundaries: **0/s**. At each TTL boundary (t≈20, t≈40): seq_scans spike to **~165/s peak** (vs 0/s valleys). Total **3,129 seq_scans** / 52s. Each is a `count(*)` on 600k rows — expensive work amplified by synchronized expiry | — (cure = more jitter) |
+| 5 (list avalanche, after — jitter 50%) | 2026-10-07 | same regime, `CACHE_TTL_JITTER_PCT=50` | — | — | — | 0% | — | **±50% jitter flattens it**: re-expiry burst gone — smooth **~60–95/s band** from t≈20 onward, no spike, no 0/s valleys. Peak 181/s is the one-time warm/cold-fill (t≈2–5), not a re-expiry spike. Total **3,333** ≈ baseline (zero extra DB work — jitter only *moves* expiries, does not add refreshes). At production TTL=300s even ±10% already spreads 500 keys over 60s ≈ 8/s (insight #13). XFetch tested here and **rejected** — see note |
 
 > **Caveat — every `4c-*` before-number is `DB_MAX_CONNS=1` *simulated* contention, not a healthy pool.** At the realistic `DB_MAX_CONNS=48` these herds/stampedes are absorbed by idle connections (sub-ms, no latency impact — insight #3/#8), so the 4c fixes are **insurance for the contended regime** (shared/pgbouncer-capped Postgres at 10K+ / cloud), not wins observed at a healthy pool on this box.
 >
@@ -75,6 +78,8 @@ attributable per layer from the client side, not just in server logs.
 <sub>Rung 4c — T26 (stampede cure: `singleflight`). `Service.Get` wraps the miss→`GetItem`→`Set` block in `s.sf.Do(key, …)` (`golang.org/x/sync/singleflight`, promoted from indirect): when a hot key expires, the first goroutine does the DB read + repopulate and all concurrent followers wait and share its result. Per-expiry DB reads **41 → 1** (peak), total **142 → 8** over the run (≈1 per expiry = ideal), 0 5xx, p95 flat at ~3.5ms. **Instrument correction — second occurrence of the T23 lesson.** The T25 proof polled Valkey `keyspace_misses`, which counts *cache* misses; singleflight collapses the *DB* reads **downstream** of the misses while the miss count is unchanged (every request still runs its own `cache.Get`). Measured at the cache, the fix looks like it does nothing (misses still ~350/run); measured at the DB (`pg_stat_user_tables.idx_scan` on `items`, one PK scan per `GetItem`) it's a 41→1 collapse. `loadtest/cache_stampede.js` + `make load-cache-stampede` now poll `idx_scan`, not `keyspace_misses` — measure the layer the symptom lives in. Deterministic regression: `TestSingleflight_CollapsesConcurrentMisses` (integration) uses a barrier cache that releases 50 callers simultaneously and asserts exactly one `Set` (= one DB load). Two ponytail caveats in the code: `Do` shares the leader's ctx (a cancelled leader fails its followers — fine for a sub-ms PK read; `DoChan` if the loader grows slow), and no in-closure cache re-check (singleflight already collapses the burst). **Ops gotcha:** the integration suite's `setupPool` `TRUNCATE`s `items`, destroying the 100k k6 seed — re-run `make load-seed N=100000` after `go test -tags=integration` before any cache k6 proof. Next symptom, T27: XFetch (probabilistic early recompute) — only if p99 still spikes at the TTL boundary after singleflight.</sub>
 
 <sub>Rung 4c — T27 (XFetch) **CLOSED — not earned, with the correct gate (DB read count).** Gate corrected from p99 to `idx_scan` per the 4c rule. Rewrote `cache_boundary.js` as a multi-key scenario mirroring the avalanche structure (warm 1000 keys → read across the TTL boundary) but with all shipping defences ON (jitter + singleflight), plus an `idx_scan` poller in `make load-cache-boundary`. **Measured boundary spike:** at 20s TTL / ±10% jitter = 1000 reads in ~6s, peak 194/s (structural: 1000 keys × 1 read/key, spread by jitter, each collapsed by singleflight). At 60s TTL = same reads in ~16s, peak 149/s. At production 300s TTL, ±10% jitter = ±30s (60s band) → ~17 reads/s — essentially flat. **XFetch was built, tested, and reverted.** The formula (`remaining < delta * beta * -ln(rand)`) requires `delta` (recompute duration) to be a meaningful fraction of the TTL. A sub-ms PK read (~200µs) against a 20s TTL gives `delta/remaining ≈ 0.00001` — the threshold is ~1667× too small to trigger before actual expiry. A prototype confirmed: XFetch ON produced an identical boundary spike (peak 296/s, total 2505 vs 2321 OFF — actually *more* reads from the wasted early-refresh attempts at t=2-3). **XFetch is designed for expensive recomputes (100ms+); for fast PK reads, jitter (T24) + singleflight (T26) are sufficient.** The boundary spike is a structural minimum (each key must refresh once) that jitter already distributes proportionally to TTL. Code reverted (~80 lines). Lesson: the correct gate reveals the correct answer — the boundary spike IS the jitter window, and the jitter window scales with TTL. At production TTL it's already flat.</sub>
+
+<sub>Rung 5 — list cache: version invalidation + avalanche cure. Three changes. (1) **Cache-aside + singleflight on `Service.List`** (same pattern as `Get`), tiered cache + TTL + jitter. (2) **Exact `count(*)`** replaces the `reltuples` estimate — the cache absorbs the cost (fires once per TTL per page, not per request); `CountItemsEstimate`, `RowQuerier`, and the dead `pool` field deleted. (3) **Version-key invalidation** fixes the staleness bug: without it, `Create`/`SoftDelete`/`Delete` left cached list pages stale (new/deleted items invisible up to TTL). The key is now `items:list:<ver>:<page>:<size>`; writes `INCR` a version counter so every pre-write list key orphans (expires by TTL — no `KEYS`/`SCAN`/per-page delete). The version is stored as a **raw Valkey `INCR`/`GET`, NOT through `cache.Cache`** — the tiered cache fronts L2 with a fixed-TTL L1 (`tiered.go`), so a version read through the cache would be stale up to the L1 TTL after a bump, defeating the fix. `rdb == nil` (Valkey off) falls back to an in-process `atomic.Int64` (single-instance; cross-instance invalidation needs Valkey). Fail-open throughout — a version read/bump error never 5xxs. Cost: one sub-ms Valkey `GET` per `List` (far cheaper than the `count(*)` it guards). Proven by `TestListVersionInvalidation_Integration` (Create → immediate re-List of the SAME page shows the new row; SoftDelete drops it). **Avalanche cure — jitter, not XFetch.** New scenario `loadtest/cache_list_avalanche.js` (`make load-cache-list-avalanche`) warms PAGES pages in a burst, reads across the TTL boundary, polls `pg_stat_user_tables.seq_scan`/s. At ±10% jitter: flat 0/s between boundaries, **~165/s spike** at each TTL edge (3,129 total). XFetch was built and tested here and **rejected** (insight #18): at beta=1 it is a no-op (`delta` = tens-of-ms count(*) ≪ 20s TTL → refresh nudged only a few ms early); at beta=200 it smooths the curve but **raises total DB work 70%** (3,129→5,319) by over-refreshing. Raising **jitter to ±50% flattened the burst to a smooth ~60–95/s band at zero extra total work** (3,333 ≈ baseline) — jitter moves expiries, it does not add refreshes. At production TTL=300s even ±10% spreads 500 keys over a 60s band ≈ 8/s (insight #13). XFetch code reverted; `CACHE_TTL_JITTER_PCT` is the avalanche knob.</sub>
 
 <sub>Rung 3: `make load RPS=100 DURATION=30s`, same 100k rows, single local instance. 7501 reqs, 0 failed, 100% checks. pgxpool wait measured indirectly — `server_repo_ms` (which wraps query + connection acquire via `TrackRepo`) held at p95=1ms identical to rung 2, so a 10× load increase added no acquire latency. `DB_MAX_CONNS` left at the 48 default (4×NumCPU=12); no index or pool change earned. Target p95 < 30ms met. Local-box headroom for higher rungs documented in `docs/local-tuning.md`.</sub>
 
@@ -132,6 +137,77 @@ The cached `GET /items/:id` is still sub-ms at 15K (median 0ms) — the cache ti
 5. **Connection pooler (PgBouncer)** — multiplex 1000s of goroutine connections through 32 real Postgres connections. Eliminates the conn-limit ceiling.
 
 The lazy fix is #1 (cache list page 1) — it's the same cache-aside pattern already proven for single-item reads, and it eliminates ~80% of the DB-bound list traffic.
+
+---
+
+## Rung 5 cloud retest — list cache vs the T29 15K ceiling (2026-10-09)
+
+Same two `c6i.2xlarge` topology as T29 (API+PG+Valkey co-located, k6 on the second
+box), `DB_MAX_CONNS=16`, 100k seed, all cache tiers on. One variable changed vs T29:
+`Service.List` is now cached (cache-aside + singleflight + version-key invalidation).
+Hypothesis: T29 broke at 15K because the un-cached list saturated the 16-conn pool
+(`repo_ms` p95 747ms). Does the list cache lift it?
+
+| run | target | achieved rps | p95 | repo_ms p95 | handler_ms p95 | bottleneck |
+|---|---|---|---|---|---|---|
+| T29 (no list cache) | 10K | 16,665 | 108ms | 104ms | — | DB pool (list) |
+| T29 (no list cache) | 15K | 19,035 | **931ms** ❌ | **747ms** | — | DB pool (list) |
+| list cache | 10K | 16,664 | **7.3ms** | **0ms** | 0ms | none (DB out of path) |
+| list cache | 15K | 21,521 | 259ms ❌ | **0ms** | **52ms** | per-request version GET |
+| list cache + in-proc version cache | 15K | 21,724 | 249ms ❌ | 0ms | **0ms** | **k6 generator (rig)** |
+| …same server, lightened client (`ceiling.js`) | 15K | 24,994 | **7.39ms** ✓ | — | — | server idle — **true number** |
+| …lightened client, push to ceiling | 20K | 32,897 | 276ms ❌ | — | — | **server CPU-saturated (real ceiling)** |
+
+**Result: the T29 DB-pool ceiling is gone.** `repo_ms` collapsed 747ms → **0** — Postgres
+is no longer touched on the hot path at 15K. The list cache did exactly what the T29
+"what would fix 15K" note predicted.
+
+**Two bottlenecks surfaced and moved, in order:**
+
+1. **The version GET became the hot path.** With L1 absorbing all list *data* GETs, the
+   only per-request Valkey op left was the raw `GET items:listver` we added for
+   invalidation — ~10.7K round-trips/s at 21.5K rps, **relayed by docker-proxy** (box-1
+   sampler: docker-proxy 20–68% CPU, valkey ~19%, box CPU idle → 2.2%). `handler_ms`/
+   `service_ms` p95 = 52ms while `repo_ms` = 0. Fix: an in-process 1s cache in front of
+   the version read (commit 6667974) — box-1 sampler after: valkey **2%**, docker-proxy
+   gone from the top list, box idle 17–88%, `handler_ms`/`service_ms` p95 → **0**.
+
+2. **The load generator is now the wall.** After the fix, `handler_ms` p95 = 0 and box 1
+   is half-idle, yet k6 still reports p95 ≈ 249ms. Box-2 (k6) sampler: CPU idle → **0.0%**
+   sustained. One 8-vCPU k6 box pegs at ~21.7K req/s parsing JSON (`res.json()`) + running
+   envelope checks on every response, and its wall-clock latency inflates once saturated.
+   **The server already clears 15K with ~0ms server-side time; we cannot stress it with one
+   k6 box.** Added `loadtest/ceiling.js` (`make load-ceiling`) — `discardResponseBodies` +
+   status-only checks — to strip the k6-side cost.
+
+**Clean 15K number (lightened client).** Re-ran 15K with `ceiling.js`: p95 **7.39ms**
+(vs 249ms with `load.js`), p99 18.4ms, 24,994 req/s, 0 errors, 0 drops — and k6 used only
+**134 of 4000 VUs** (iterations averaging 3ms). That proves the 249ms was **100% rig
+artifact**: same server, same target, the only change was not parsing JSON on the client.
+The honest rung-5 15K figure is **p95 = 7.39ms** — i.e. T29's 931ms → 7.39ms, ~126×.
+(A 30K attempt with `ceiling.js` hit the single k6 box's limits — VU-cap + 339K dropped
+iterations, p95 1.18s at 34.9K req/s — so ~35K req/s is one lightened generator's ceiling,
+not the server's. True server ceiling still needs a 2nd generator or a bigger k6 box.)
+
+**True server ceiling found (lightened client + box-1 sampler).** Pushing `ceiling.js` to
+20K target drove **32,897 req/s** at p95 276ms with **box 1 CPU-saturated** (idle → 0%,
+`us` 80%, `si` 7–12%) — and **Postgres 0%, Valkey ~0–8%**. The 8 vCPUs now go to the **Go
+app + network softirq**, not the DB or cache: per-request envelope serialization, gin +
+middleware + request-id + per-request slog, and netpoll for 33K req/s / 66 MB/s. That is a
+genuine CPU ceiling, not a cacheable bottleneck and not the rig. **Server ceiling ≈ 33K
+req/s (~16.4K iters/s) on one 8-vCPU co-located box; clean p95 < 10ms up to ~25K req/s.**
+Co-location is no longer the issue (PG/Valkey idle) — the app owns the cores. To go higher:
+more cores, or shave per-request CPU (reuse buffers, sample/disable per-request logging under
+load) — rung-6 territory.
+
+**Status:** rung-5 goal met and exceeded. T29 died at 15K (DB pool, 931ms); now DB + cache
+are both ~0% and the service is CPU-bound at **~33K req/s** on 8 vCPU, clean p95<10ms to
+~25K. The read path has no DB/cache ceiling left — the next limit is raw app CPU.
+
+**Cost:** 2× `c6i.2xlarge` ap-south-1 on-demand ≈ $0.34–0.41/hr each; the session ran a few
+hours → **≈ $2–3 total** (estimate). Both instances + SG + key pair + billing alarm torn
+down same day. Decision recorded in ADR 0008; next rung is horizontal (externalize PG/Valkey,
+ALB + replicas) — see `docs/cloud-loadtest.md` for the runbook.
 
 ---
 
@@ -304,3 +380,78 @@ Snapshot of the finished rung-4 code with everything enabled: cache-aside on
     at boot (<100ms for 100k rows). Cold-start matters only under instant-spike
     scenarios (0→10K in <1s) — the ramp pattern used by `load.js` hides it. A spike
     test (`spike.js`) with a cold cache would expose it if needed.
+
+18. **XFetch needs `delta ≈ TTL`; jitter needs neither — jitter wins the avalanche.**
+    The list cache looked like XFetch's case (count(*) is a real seq scan, not a sub-ms
+    PK read), so it was built and measured against the 500-page avalanche. It failed the
+    same way as T27: `delta` (tens of ms) is still ~1000× smaller than a 20s TTL, so the
+    trigger window `delta·beta·(−ln rand)` is tens of ms wide — at beta=1 it nudges the
+    refresh a few ms early (**no-op**, peak 165→193/s). Cranking beta=200 to widen the
+    window to seconds *did* smooth the curve but **raised total DB work 70%** (3,129→5,319
+    seq_scans) by refreshing every key several times per natural TTL — the opposite of the
+    goal (less DB work). **Jitter is the correct lever and it's free:** ±50% jitter
+    flattened the boundary burst to a smooth ~60–95/s band at **3,333 total ≈ the ±10%
+    baseline of 3,129** — because jitter only *moves* each key's single expiry, it never
+    adds a refresh. XFetch trades a spike for more total work; jitter trades a spike for a
+    wider window at constant work. The avalanche is a *when-they-expire* problem, and
+    jitter controls exactly that (spread = ±pct·TTL) with no downside. XFetch is only worth
+    its complexity when `delta` is a real fraction of the TTL (100ms+ recompute against a
+    few-second TTL) so the window is meaningful AND the refresh genuinely avoids a re-miss.
+    Neither held here. Reverted; `CACHE_TTL_JITTER_PCT` is the knob.
+
+19. **Caching the list endpoint removed the exact T29 ceiling — the hypothesis-driven
+    retest paid off.** T29 named the 15K wall precisely (un-cached list → 16-conn pool →
+    `repo_ms` p95 747ms) and predicted "cache the list" as the fix. The cloud retest, one
+    variable changed, confirmed it: 15K `repo_ms` **747ms → 0**, Postgres untouched on the
+    hot path. Writing the ceiling analysis *with the predicted fix* at T29 turned the next
+    rung into a one-line verification instead of a fresh investigation. A load-test result
+    is worth more when it ends with the next experiment, not just the current number.
+
+20. **The thing you add to make caching correct can become the hot path.** Version-key
+    invalidation needs a per-request version read. Once L1 absorbed the list *data*, that
+    auxiliary `GET items:listver` was the ONLY per-request Valkey op left — ~10.7K round-
+    trips/s — and it, not the data, saturated the box (through docker-proxy). The fix was
+    to memoize the aux lookup in-process (1s TTL) just as aggressively as the data. Lesson:
+    when you cache the expensive thing, the next bottleneck is whatever you left un-cached
+    on the same path — including your own correctness machinery. Also: **docker-proxy
+    (Docker's userland port relay) is a real CPU cost at high rps** and a co-location
+    artifact — publishing Valkey's port taxes the shared box; a separate/host-networked
+    Valkey (or managed instance, as in prod) removes that hop.
+
+21. **`handler_ms`=0 with `http_req_duration`=249ms means the bottleneck is outside the
+    app — measure both ends.** After the version-cache fix the server processed each
+    request in ~0ms server-side (handler/service/repo all p95=0) with the server box
+    half-idle, yet k6 reported p95=249ms. The gap lives in the transport + the load
+    generator: box-2 (k6) CPU idle → **0.0%**. One 8-vCPU k6 box tops out ~21.7K req/s
+    because `res.json()` + per-response checks peg it, and a saturated generator inflates
+    its own wall-clock latency. You cannot measure a server ceiling with a generator that
+    is itself the ceiling. Sample CPU on BOTH boxes; the fix is a lighter client
+    (`discardResponseBodies`, status-only checks — `loadtest/ceiling.js`) or a second
+    generator, never a bigger server. Generalizes insights #5/#15: the rig is always in
+    the measurement, and server-side timing (`handler_ms`) is how you prove it is the rig.
+
+22. **Verify the new binary is actually serving before trusting a before/after — a
+    `go run` child outlives `pkill`.** The first retest of the version-cache fix showed
+    no change (p95 259→249ms) and nearly sent us down the wrong path. Cause: `go run
+    ./cmd/server` spawns a **child** binary (`/tmp/go-build…/exe/server`) that holds the
+    port; `pkill -f 'cmd/server'` matched the `go run` wrapper but not the child, so the
+    **old binary kept serving** and the "fix" never deployed. The result was a clean,
+    plausible, and completely meaningless before/after. Fix: kill by port
+    (`fuser -k 8000/tcp`) or build an explicit binary (`go build -o /tmp/app`) so there is
+    one process to manage, and confirm deployment out-of-band (`git rev-parse HEAD`, a
+    boot log line, or a behaviour probe) before believing any A/B number. A perf result
+    from an unverified deploy is worse than no result — it looks like evidence.
+
+23. **A well-tuned read service bottoms out on app CPU, not the DB or cache — and that's
+    the goal.** Once the list cache + version cache were in, pushing a lightened client to
+    ~33K req/s saturated the server box's 8 vCPUs with **Postgres and Valkey both ~0%**.
+    The CPU went to the Go app (`us` 80%) + network softirq (`si` 7–12%): per-request
+    envelope serialization, gin/middleware/request-id, per-request slog, and netpoll at
+    66 MB/s. Clean p95 < 10ms held to ~25K req/s. This is the healthy end state — every
+    cacheable/DB bottleneck has been pushed off the hot path (T29's DB pool → 0, the
+    version GET → memoized), so the only thing left to saturate is raw compute. The ceiling
+    moved from "16 DB connections" (T29, fixable with a cache) to "8 CPU cores" (fixable
+    only with more cores or less per-request work). Knowing *which* resource binds tells you
+    the next lever: it's now horizontal scale or per-request CPU shaving (buffer reuse,
+    sampled logging), not another cache. Co-location stopped mattering once PG/Valkey went
+    idle — the app already owns the cores.

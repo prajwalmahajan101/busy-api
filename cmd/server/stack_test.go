@@ -20,7 +20,7 @@ const reqIDHeader = "X-Request-ID"
 func routerWithMaxBody(maxBytes int64) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	cfg := &config.Config{MaxBodyBytes: maxBytes, Env: "local"}
-	return buildRouter(cfg, logging.Setup(), nil, cache.NewProvider(nil).Get("test"), nil)
+	return buildRouter(cfg, logging.Setup(), nil, nil, cache.NewProvider(nil).Get("test"), nil)
 }
 
 func TestStackOversizedBodyReturns413(t *testing.T) {

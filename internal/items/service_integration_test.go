@@ -66,7 +66,7 @@ func countItems(t *testing.T, pool *pgxpool.Pool) int64 {
 
 func TestItemsCRUD_Integration(t *testing.T) {
 	pool := setupPool(t)
-	svc := NewService(pool, memCache(), time.Minute, time.Minute, nil)
+	svc := NewService(pool, nil, memCache(), time.Minute, time.Minute, nil)
 	ctx := context.Background()
 
 	for i := 0; i < 3; i++ {
@@ -75,9 +75,7 @@ func TestItemsCRUD_Integration(t *testing.T) {
 		}
 	}
 
-	// Assertions are on the actual returned rows (exact via ListItems), not the
-	// `total` — which is now a reltuples ESTIMATE (rung 2) and does not reflect
-	// uncommitted stats or the is_active filter.
+	// Assertions are on the actual returned rows (exact via ListItems).
 
 	// Page 1 of 2: two of the three rows.
 	page1, _, err := svc.List(ctx, 1, 2)
@@ -115,6 +113,56 @@ func TestItemsCRUD_Integration(t *testing.T) {
 	}
 }
 
+// TestListVersionInvalidation_Integration proves the list cache is invalidated on
+// writes: re-listing the SAME (page,size) after a Create/SoftDelete must reflect
+// the change, not a stale cached page. Uses the in-memory cache (atomic-fallback
+// version path, single-instance). The pre-fix code (no version bump) fails the
+// post-write assertions.
+func TestListVersionInvalidation_Integration(t *testing.T) {
+	pool := setupPool(t)
+	svc := NewService(pool, nil, memCache(), time.Minute, time.Minute, nil)
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := svc.Create(ctx, []byte(`{"n":`+strconv.Itoa(i)+`}`)); err != nil {
+			t.Fatalf("create %d: %v", i, err)
+		}
+	}
+
+	// Populate the cache for page 1.
+	page, _, err := svc.List(ctx, 1, 10)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("len = %d, want 2", len(page))
+	}
+
+	// Create a third item, then re-list the SAME page: must show 3, not a stale 2.
+	if _, err := svc.Create(ctx, []byte(`{"n":2}`)); err != nil {
+		t.Fatalf("create 3rd: %v", err)
+	}
+	page, _, err = svc.List(ctx, 1, 10)
+	if err != nil {
+		t.Fatalf("list after create: %v", err)
+	}
+	if len(page) != 3 {
+		t.Fatalf("stale list after create: len = %d, want 3", len(page))
+	}
+
+	// Soft-delete one, re-list the same page: must drop to 2.
+	if err := svc.SoftDelete(ctx, page[0].ID); err != nil {
+		t.Fatalf("soft delete: %v", err)
+	}
+	page, _, err = svc.List(ctx, 1, 10)
+	if err != nil {
+		t.Fatalf("list after soft-delete: %v", err)
+	}
+	if len(page) != 2 {
+		t.Fatalf("stale list after soft-delete: len = %d, want 2", len(page))
+	}
+}
+
 // TestCacheFailOpen_Integration proves F-6 / T20: with the cache backend pointed
 // at a DOWN Valkey, every cache op fails open to a miss and the read is served
 // from Postgres — never a 5xx. A cache outage degrades latency, never
@@ -124,7 +172,7 @@ func TestCacheFailOpen_Integration(t *testing.T) {
 	ctx := context.Background()
 
 	// Seed one row (via an in-memory-cached service, unrelated to the assertion).
-	created, err := NewService(pool, memCache(), time.Minute, time.Minute, nil).Create(ctx, []byte(`{"k":1}`))
+	created, err := NewService(pool, nil, memCache(), time.Minute, time.Minute, nil).Create(ctx, []byte(`{"k":1}`))
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
@@ -135,7 +183,7 @@ func TestCacheFailOpen_Integration(t *testing.T) {
 		DialTimeout: 200 * time.Millisecond,
 	})
 	t.Cleanup(func() { _ = down.Close() })
-	svc := NewService(pool, cache.NewProvider(down).Get("items"), time.Minute, time.Minute, nil)
+	svc := NewService(pool, nil, cache.NewProvider(down).Get("items"), time.Minute, time.Minute, nil)
 
 	got, err := svc.Get(ctx, created.ID)
 	if err != nil {
@@ -188,14 +236,14 @@ func TestSingleflight_CollapsesConcurrentMisses(t *testing.T) {
 	pool := setupPool(t)
 	ctx := context.Background()
 
-	created, err := NewService(pool, memCache(), time.Minute, time.Minute, nil).Create(ctx, []byte(`{"hot":1}`))
+	created, err := NewService(pool, nil, memCache(), time.Minute, time.Minute, nil).Create(ctx, []byte(`{"hot":1}`))
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
 	}
 
 	const n = 50
 	bc := newBarrierCache(n)
-	svc := NewService(pool, bc, time.Minute, time.Minute, nil)
+	svc := NewService(pool, nil, bc, time.Minute, time.Minute, nil)
 
 	var wg sync.WaitGroup
 	wg.Add(n)
@@ -223,7 +271,7 @@ func TestBloomShortCircuit_Integration(t *testing.T) {
 	pool := setupPool(t)
 	ctx := context.Background()
 
-	seed := NewService(pool, memCache(), time.Minute, time.Minute, nil)
+	seed := NewService(pool, nil, memCache(), time.Minute, time.Minute, nil)
 	real, err := seed.Create(ctx, []byte(`{"real":1}`))
 	if err != nil {
 		t.Fatalf("seed create: %v", err)
@@ -233,7 +281,7 @@ func TestBloomShortCircuit_Integration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new presence: %v", err)
 	}
-	svc := NewService(pool, memCache(), time.Minute, time.Minute, presence)
+	svc := NewService(pool, nil, memCache(), time.Minute, time.Minute, presence)
 
 	// A real id must still resolve — the bloom has no false negatives.
 	if _, err := svc.Get(ctx, real.ID); err != nil {
@@ -256,7 +304,7 @@ func TestNegativeCache_Integration(t *testing.T) {
 	c := memCache()
 	// presence nil → bloom disabled, so the absent id reaches the DB once and the
 	// loader writes the tombstone (the false-positive path, forced deterministically).
-	svc := NewService(pool, c, time.Minute, time.Minute, nil)
+	svc := NewService(pool, nil, c, time.Minute, time.Minute, nil)
 
 	const absent = int64(1_234_567)
 	if _, err := svc.Get(ctx, absent); err == nil {
