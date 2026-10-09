@@ -181,3 +181,28 @@ busyapi-loadtest-spend --region us-east-1`) and the key pair if done.
   blaming the DB tier.
 - **15K passes but p95 breaks elsewhere** → bottleneck moved (CPU/Valkey/LB). That
   is the rung-6 trigger, not a list-cache problem.
+
+## Gotchas hit on the 2026-10-09 run (clean AL2023 box — fix up front next time)
+
+Prereqs `dnf install docker golang` does NOT give you; install explicitly:
+- **Compose v2 plugin** is not bundled — `docker compose` fails with "unknown shorthand
+  flag: 'd'". Install the plugin binary into `/usr/local/lib/docker/cli-plugins/`
+  (see step 3) or the hyphenated standalone `docker-compose`.
+- **`psql`** — `sudo dnf install -y postgresql15` (client only; the server runs in Docker).
+- **`make`** — `sudo dnf install -y make` on the k6 box (or call `k6 run …` directly).
+- **`goose`** — `go install github.com/pressly/goose/v3/cmd/goose@latest` then
+  `export PATH=$PATH:$(go env GOPATH)/bin`. Migrations are goose-format (Up/Down markers),
+  so you cannot just `psql -f` the files — use `make migrate-up`.
+- **Postgres is NOT in `docker-compose.yml`** (only Valkey). Run it yourself:
+  `docker run -d --name busy-api-postgres -e POSTGRES_USER=root -e POSTGRES_PASSWORD=root_password -e POSTGRES_DB=busyapi -p 5432:5432 postgres:16-alpine`
+  (creds MUST match `DATABASE_URL`). Consider adding a postgres service to the compose
+  file to collapse this to one step.
+
+Deploy/verify discipline (cost us a wasted test cycle):
+- **`go run` spawns a child binary that survives `pkill -f cmd/server`** — the wrapper
+  dies but the child keeps holding :8000, so your new code never deploys and the A/B is
+  meaningless. **Kill by port** (`sudo fuser -k 8000/tcp`) or build one binary
+  (`go build -o /tmp/busyapi ./cmd/server && nohup /tmp/busyapi …`), and **verify** with
+  `git rev-parse --short HEAD` + a `curl /ping` before trusting any before/after.
+- Re-apply the FD / ephemeral-port sysctls (`docs/local-tuning.md`) on BOTH boxes after
+  any instance stop/resize — they are per-boot unless persisted.

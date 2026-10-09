@@ -140,6 +140,49 @@ The lazy fix is #1 (cache list page 1) — it's the same cache-aside pattern alr
 
 ---
 
+## Rung 5 cloud retest — list cache vs the T29 15K ceiling (2026-10-09)
+
+Same two `c6i.2xlarge` topology as T29 (API+PG+Valkey co-located, k6 on the second
+box), `DB_MAX_CONNS=16`, 100k seed, all cache tiers on. One variable changed vs T29:
+`Service.List` is now cached (cache-aside + singleflight + version-key invalidation).
+Hypothesis: T29 broke at 15K because the un-cached list saturated the 16-conn pool
+(`repo_ms` p95 747ms). Does the list cache lift it?
+
+| run | target | achieved rps | p95 | repo_ms p95 | handler_ms p95 | bottleneck |
+|---|---|---|---|---|---|---|
+| T29 (no list cache) | 10K | 16,665 | 108ms | 104ms | — | DB pool (list) |
+| T29 (no list cache) | 15K | 19,035 | **931ms** ❌ | **747ms** | — | DB pool (list) |
+| list cache | 10K | 16,664 | **7.3ms** | **0ms** | 0ms | none (DB out of path) |
+| list cache | 15K | 21,521 | 259ms ❌ | **0ms** | **52ms** | per-request version GET |
+| list cache + in-proc version cache | 15K | 21,724 | 249ms ❌ | 0ms | **0ms** | **k6 generator (rig)** |
+
+**Result: the T29 DB-pool ceiling is gone.** `repo_ms` collapsed 747ms → **0** — Postgres
+is no longer touched on the hot path at 15K. The list cache did exactly what the T29
+"what would fix 15K" note predicted.
+
+**Two bottlenecks surfaced and moved, in order:**
+
+1. **The version GET became the hot path.** With L1 absorbing all list *data* GETs, the
+   only per-request Valkey op left was the raw `GET items:listver` we added for
+   invalidation — ~10.7K round-trips/s at 21.5K rps, **relayed by docker-proxy** (box-1
+   sampler: docker-proxy 20–68% CPU, valkey ~19%, box CPU idle → 2.2%). `handler_ms`/
+   `service_ms` p95 = 52ms while `repo_ms` = 0. Fix: an in-process 1s cache in front of
+   the version read (commit 6667974) — box-1 sampler after: valkey **2%**, docker-proxy
+   gone from the top list, box idle 17–88%, `handler_ms`/`service_ms` p95 → **0**.
+
+2. **The load generator is now the wall.** After the fix, `handler_ms` p95 = 0 and box 1
+   is half-idle, yet k6 still reports p95 ≈ 249ms. Box-2 (k6) sampler: CPU idle → **0.0%**
+   sustained. One 8-vCPU k6 box pegs at ~21.7K req/s parsing JSON (`res.json()`) + running
+   envelope checks on every response, and its wall-clock latency inflates once saturated.
+   **The server already clears 15K with ~0ms server-side time; we cannot stress it with one
+   k6 box.** Added `loadtest/ceiling.js` (`make load-ceiling`) — `discardResponseBodies` +
+   status-only checks — to strip the k6-side cost and find the real server ceiling (30K+).
+
+**Status:** rung-5 goal met (list cache lifts the T29 ceiling). The 15K p95 "failure" is a
+rig artifact, not the service. True server ceiling pending a lightened/second generator.
+
+---
+
 ## Full ladder — current code (all optimizations on)
 
 ### Local single-box (12 cores, `DB_MAX_CONNS=48`)
@@ -327,3 +370,46 @@ Snapshot of the finished rung-4 code with everything enabled: cache-aside on
     its complexity when `delta` is a real fraction of the TTL (100ms+ recompute against a
     few-second TTL) so the window is meaningful AND the refresh genuinely avoids a re-miss.
     Neither held here. Reverted; `CACHE_TTL_JITTER_PCT` is the knob.
+
+19. **Caching the list endpoint removed the exact T29 ceiling — the hypothesis-driven
+    retest paid off.** T29 named the 15K wall precisely (un-cached list → 16-conn pool →
+    `repo_ms` p95 747ms) and predicted "cache the list" as the fix. The cloud retest, one
+    variable changed, confirmed it: 15K `repo_ms` **747ms → 0**, Postgres untouched on the
+    hot path. Writing the ceiling analysis *with the predicted fix* at T29 turned the next
+    rung into a one-line verification instead of a fresh investigation. A load-test result
+    is worth more when it ends with the next experiment, not just the current number.
+
+20. **The thing you add to make caching correct can become the hot path.** Version-key
+    invalidation needs a per-request version read. Once L1 absorbed the list *data*, that
+    auxiliary `GET items:listver` was the ONLY per-request Valkey op left — ~10.7K round-
+    trips/s — and it, not the data, saturated the box (through docker-proxy). The fix was
+    to memoize the aux lookup in-process (1s TTL) just as aggressively as the data. Lesson:
+    when you cache the expensive thing, the next bottleneck is whatever you left un-cached
+    on the same path — including your own correctness machinery. Also: **docker-proxy
+    (Docker's userland port relay) is a real CPU cost at high rps** and a co-location
+    artifact — publishing Valkey's port taxes the shared box; a separate/host-networked
+    Valkey (or managed instance, as in prod) removes that hop.
+
+21. **`handler_ms`=0 with `http_req_duration`=249ms means the bottleneck is outside the
+    app — measure both ends.** After the version-cache fix the server processed each
+    request in ~0ms server-side (handler/service/repo all p95=0) with the server box
+    half-idle, yet k6 reported p95=249ms. The gap lives in the transport + the load
+    generator: box-2 (k6) CPU idle → **0.0%**. One 8-vCPU k6 box tops out ~21.7K req/s
+    because `res.json()` + per-response checks peg it, and a saturated generator inflates
+    its own wall-clock latency. You cannot measure a server ceiling with a generator that
+    is itself the ceiling. Sample CPU on BOTH boxes; the fix is a lighter client
+    (`discardResponseBodies`, status-only checks — `loadtest/ceiling.js`) or a second
+    generator, never a bigger server. Generalizes insights #5/#15: the rig is always in
+    the measurement, and server-side timing (`handler_ms`) is how you prove it is the rig.
+
+22. **Verify the new binary is actually serving before trusting a before/after — a
+    `go run` child outlives `pkill`.** The first retest of the version-cache fix showed
+    no change (p95 259→249ms) and nearly sent us down the wrong path. Cause: `go run
+    ./cmd/server` spawns a **child** binary (`/tmp/go-build…/exe/server`) that holds the
+    port; `pkill -f 'cmd/server'` matched the `go run` wrapper but not the child, so the
+    **old binary kept serving** and the "fix" never deployed. The result was a clean,
+    plausible, and completely meaningless before/after. Fix: kill by port
+    (`fuser -k 8000/tcp`) or build an explicit binary (`go build -o /tmp/app`) so there is
+    one process to manage, and confirm deployment out-of-band (`git rev-parse HEAD`, a
+    boot log line, or a behaviour probe) before believing any A/B number. A perf result
+    from an unverified deploy is worse than no result — it looks like evidence.
