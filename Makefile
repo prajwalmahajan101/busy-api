@@ -52,7 +52,7 @@ DB_DRIVER      := postgres
         obs-up obs-down \
         load-smoke load load-stress load-spike load-soak load-matrix load-seed load-cache \
         load-cache-resilience load-cache-avalanche load-cache-stampede \
-        load-cache-list-avalanche
+        load-cache-list-avalanche load-ceiling
 
 # ---------------------------------------------------------------------------
 # Default target
@@ -313,6 +313,13 @@ load-cache-list-avalanche: ## Rung-5 proof: 10K list pages expire simultaneously
 	done; \
 	echo ">>> total seq_scans over run: $$TOTAL ; peak seq_scans/s: $$MAX ; spike at TTL boundary = avalanche proven"; \
 	wait $$K6_PID
+
+load-ceiling: ## Throughput-ceiling profile (discardResponseBodies, status-only) to find the SERVER ceiling once k6 is no longer the limit
+	k6 run loadtest/ceiling.js \
+		-e BASE_URL=$(BASE_URL) \
+		-e RPS=$(RPS) \
+		-e VUS=$(VUS) \
+		-e DURATION=$(DURATION)
 
 load-smoke: ## Run smoke test (1 VU, 30 s) against BASE_URL
 	k6 run loadtest/smoke.js -e BASE_URL=$(BASE_URL)
