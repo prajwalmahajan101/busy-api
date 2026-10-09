@@ -32,6 +32,7 @@ ITEM_TTL_S ?= 20
 WARM_S    ?= 3
 DURATION_S ?= 40
 HOT_ID    ?= 2
+PAGES     ?= 10000
 
 # Migrations
 MIGRATIONS_DIR := migrations
@@ -50,7 +51,8 @@ DB_DRIVER      := postgres
         compose-up compose-down \
         obs-up obs-down \
         load-smoke load load-stress load-spike load-soak load-matrix load-seed load-cache \
-        load-cache-resilience load-cache-avalanche load-cache-stampede
+        load-cache-resilience load-cache-avalanche load-cache-stampede \
+        load-cache-list-avalanche
 
 # ---------------------------------------------------------------------------
 # Default target
@@ -288,6 +290,28 @@ load-cache-hotkey: ## Rung-4c T28a gate: single hot key at high RPS with L1 ON (
 		PREV_DB=$$CUR_DB; PREV_VK=$$CUR_VK; sleep 1; \
 	done; \
 	echo ">>> total: db_reads=$$TOTAL_DB (peak $$MAX_DB/s), valkey_hits=$$TOTAL_VK (peak $$MAX_VK/s) ; ideal (L1 absorbs) = both ~0 after fill"; \
+	wait $$K6_PID
+
+load-cache-list-avalanche: ## Rung-5 proof: 10K list pages expire simultaneously → count(*) seq-scan burst (run API with CACHE_ITEM_TTL_S=20 CACHE_L1_ENABLED=false DB_MAX_CONNS=48)
+	@echo ">>> flushing Valkey (clean baseline)"; docker compose exec -T valkey valkey-cli flushall >/dev/null 2>&1 || docker exec valkey valkey-cli flushall >/dev/null
+	k6 run loadtest/cache_list_avalanche.js \
+		-e BASE_URL=$(BASE_URL) \
+		-e RPS=$(RPS) \
+		-e VUS=$(VUS) \
+		-e PAGES=$(PAGES) \
+		-e ITEM_TTL_S=$(ITEM_TTL_S) & \
+	K6_PID=$$!; \
+	echo "t(s)  seq_scans/s (Postgres items seq_scan delta — spike at ~TTL = list avalanche)"; \
+	Q="select seq_scan from pg_stat_user_tables where relname='items'"; \
+	TOTAL=0; MAX=0; \
+	PREV=$$(psql "$(DATABASE_URL)" -tAc "$$Q" 2>/dev/null | tr -d ' '); \
+	for t in $$(seq 0 $$(( $(ITEM_TTL_S) * 2 + $(WARM_S) + 2 )) ); do \
+		CUR=$$(psql "$(DATABASE_URL)" -tAc "$$Q" 2>/dev/null | tr -d ' '); \
+		D=$$(( $${CUR:-0} - $${PREV:-0} )); TOTAL=$$(( TOTAL + D )); [ $$D -gt $$MAX ] && MAX=$$D; \
+		printf "%4d  %s\n" "$$t" "$$D"; \
+		PREV=$$CUR; sleep 1; \
+	done; \
+	echo ">>> total seq_scans over run: $$TOTAL ; peak seq_scans/s: $$MAX ; spike at TTL boundary = avalanche proven"; \
 	wait $$K6_PID
 
 load-smoke: ## Run smoke test (1 VU, 30 s) against BASE_URL
