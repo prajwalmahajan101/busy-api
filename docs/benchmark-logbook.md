@@ -204,6 +204,11 @@ load) — rung-6 territory.
 are both ~0% and the service is CPU-bound at **~33K req/s** on 8 vCPU, clean p95<10ms to
 ~25K. The read path has no DB/cache ceiling left — the next limit is raw app CPU.
 
+**Cost:** 2× `c6i.2xlarge` ap-south-1 on-demand ≈ $0.34–0.41/hr each; the session ran a few
+hours → **≈ $2–3 total** (estimate). Both instances + SG + key pair + billing alarm torn
+down same day. Decision recorded in ADR 0008; next rung is horizontal (externalize PG/Valkey,
+ALB + replicas) — see `docs/cloud-loadtest.md` for the runbook.
+
 ---
 
 ## Full ladder — current code (all optimizations on)
