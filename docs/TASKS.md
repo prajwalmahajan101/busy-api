@@ -19,8 +19,8 @@ first and the fix second.
 | 2 | 10 rps | indexes | M3 |
 | 3 | 100 rps | pool tuning | M3 |
 | 4 | 1K rps | cache-aside + tiered L1/self-healing + cache hardening | M4 |
-| 5 | 10K rps | horizontal + observability + throttle + audit + lifecycle | M5 |
-| 6 | 100K rps | shard + CDN + audit queue sink | M6 |
+| 5 | 10K→15K→30K→50K→75K→100K | list cache + exact count, then incremental scaling (each step earned) | M5 |
+| 6 | 100K+ | shard + CDN + audit queue sink (if 100K ceiling hit) | M6 |
 | — | n/a | outbound resilience (breaker/retry/httpclient) — consumer-driven | — |
 
 Success at each rung = under its p95 budget, < 1% errors. If a 10× jump breaks,
