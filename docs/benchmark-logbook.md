@@ -155,6 +155,7 @@ Hypothesis: T29 broke at 15K because the un-cached list saturated the 16-conn po
 | list cache | 10K | 16,664 | **7.3ms** | **0ms** | 0ms | none (DB out of path) |
 | list cache | 15K | 21,521 | 259ms ❌ | **0ms** | **52ms** | per-request version GET |
 | list cache + in-proc version cache | 15K | 21,724 | 249ms ❌ | 0ms | **0ms** | **k6 generator (rig)** |
+| …same server, lightened client (`ceiling.js`) | 15K | 24,994 | **7.39ms** ✓ | — | — | server idle — **true number** |
 
 **Result: the T29 DB-pool ceiling is gone.** `repo_ms` collapsed 747ms → **0** — Postgres
 is no longer touched on the hot path at 15K. The list cache did exactly what the T29
@@ -176,10 +177,20 @@ is no longer touched on the hot path at 15K. The list cache did exactly what the
    envelope checks on every response, and its wall-clock latency inflates once saturated.
    **The server already clears 15K with ~0ms server-side time; we cannot stress it with one
    k6 box.** Added `loadtest/ceiling.js` (`make load-ceiling`) — `discardResponseBodies` +
-   status-only checks — to strip the k6-side cost and find the real server ceiling (30K+).
+   status-only checks — to strip the k6-side cost.
 
-**Status:** rung-5 goal met (list cache lifts the T29 ceiling). The 15K p95 "failure" is a
-rig artifact, not the service. True server ceiling pending a lightened/second generator.
+**Clean 15K number (lightened client).** Re-ran 15K with `ceiling.js`: p95 **7.39ms**
+(vs 249ms with `load.js`), p99 18.4ms, 24,994 req/s, 0 errors, 0 drops — and k6 used only
+**134 of 4000 VUs** (iterations averaging 3ms). That proves the 249ms was **100% rig
+artifact**: same server, same target, the only change was not parsing JSON on the client.
+The honest rung-5 15K figure is **p95 = 7.39ms** — i.e. T29's 931ms → 7.39ms, ~126×.
+(A 30K attempt with `ceiling.js` hit the single k6 box's limits — VU-cap + 339K dropped
+iterations, p95 1.18s at 34.9K req/s — so ~35K req/s is one lightened generator's ceiling,
+not the server's. True server ceiling still needs a 2nd generator or a bigger k6 box.)
+
+**Status:** rung-5 goal met — list cache lifts the T29 ceiling; clean 15K = p95 7.39ms.
+The earlier 249ms "failure" was the rig. True server ceiling (>15K) pending a lightened
+2nd/bigger generator.
 
 ---
 
