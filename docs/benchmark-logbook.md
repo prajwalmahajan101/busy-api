@@ -156,6 +156,7 @@ Hypothesis: T29 broke at 15K because the un-cached list saturated the 16-conn po
 | list cache | 15K | 21,521 | 259ms ❌ | **0ms** | **52ms** | per-request version GET |
 | list cache + in-proc version cache | 15K | 21,724 | 249ms ❌ | 0ms | **0ms** | **k6 generator (rig)** |
 | …same server, lightened client (`ceiling.js`) | 15K | 24,994 | **7.39ms** ✓ | — | — | server idle — **true number** |
+| …lightened client, push to ceiling | 20K | 32,897 | 276ms ❌ | — | — | **server CPU-saturated (real ceiling)** |
 
 **Result: the T29 DB-pool ceiling is gone.** `repo_ms` collapsed 747ms → **0** — Postgres
 is no longer touched on the hot path at 15K. The list cache did exactly what the T29
@@ -188,9 +189,20 @@ The honest rung-5 15K figure is **p95 = 7.39ms** — i.e. T29's 931ms → 7.39ms
 iterations, p95 1.18s at 34.9K req/s — so ~35K req/s is one lightened generator's ceiling,
 not the server's. True server ceiling still needs a 2nd generator or a bigger k6 box.)
 
-**Status:** rung-5 goal met — list cache lifts the T29 ceiling; clean 15K = p95 7.39ms.
-The earlier 249ms "failure" was the rig. True server ceiling (>15K) pending a lightened
-2nd/bigger generator.
+**True server ceiling found (lightened client + box-1 sampler).** Pushing `ceiling.js` to
+20K target drove **32,897 req/s** at p95 276ms with **box 1 CPU-saturated** (idle → 0%,
+`us` 80%, `si` 7–12%) — and **Postgres 0%, Valkey ~0–8%**. The 8 vCPUs now go to the **Go
+app + network softirq**, not the DB or cache: per-request envelope serialization, gin +
+middleware + request-id + per-request slog, and netpoll for 33K req/s / 66 MB/s. That is a
+genuine CPU ceiling, not a cacheable bottleneck and not the rig. **Server ceiling ≈ 33K
+req/s (~16.4K iters/s) on one 8-vCPU co-located box; clean p95 < 10ms up to ~25K req/s.**
+Co-location is no longer the issue (PG/Valkey idle) — the app owns the cores. To go higher:
+more cores, or shave per-request CPU (reuse buffers, sample/disable per-request logging under
+load) — rung-6 territory.
+
+**Status:** rung-5 goal met and exceeded. T29 died at 15K (DB pool, 931ms); now DB + cache
+are both ~0% and the service is CPU-bound at **~33K req/s** on 8 vCPU, clean p95<10ms to
+~25K. The read path has no DB/cache ceiling left — the next limit is raw app CPU.
 
 ---
 
@@ -424,3 +436,17 @@ Snapshot of the finished rung-4 code with everything enabled: cache-aside on
     one process to manage, and confirm deployment out-of-band (`git rev-parse HEAD`, a
     boot log line, or a behaviour probe) before believing any A/B number. A perf result
     from an unverified deploy is worse than no result — it looks like evidence.
+
+23. **A well-tuned read service bottoms out on app CPU, not the DB or cache — and that's
+    the goal.** Once the list cache + version cache were in, pushing a lightened client to
+    ~33K req/s saturated the server box's 8 vCPUs with **Postgres and Valkey both ~0%**.
+    The CPU went to the Go app (`us` 80%) + network softirq (`si` 7–12%): per-request
+    envelope serialization, gin/middleware/request-id, per-request slog, and netpoll at
+    66 MB/s. Clean p95 < 10ms held to ~25K req/s. This is the healthy end state — every
+    cacheable/DB bottleneck has been pushed off the hot path (T29's DB pool → 0, the
+    version GET → memoized), so the only thing left to saturate is raw compute. The ceiling
+    moved from "16 DB connections" (T29, fixable with a cache) to "8 CPU cores" (fixable
+    only with more cores or less per-request work). Knowing *which* resource binds tells you
+    the next lever: it's now horizontal scale or per-request CPU shaving (buffer reuse,
+    sampled logging), not another cache. Co-location stopped mattering once PG/Valkey went
+    idle — the app already owns the cores.
