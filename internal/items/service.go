@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -18,6 +19,7 @@ import (
 	"github.com/prajwalmahajan101/busyapi/internal/resilience/cache"
 	"github.com/prajwalmahajan101/busyapi/internal/store"
 	storedb "github.com/prajwalmahajan101/busyapi/internal/store/db"
+	"github.com/redis/go-redis/v9"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -56,11 +58,18 @@ const (
 // a tombstone is unambiguously distinguishable from a real cached value.
 var tombstone = []byte{0}
 
+// itemsVerKey is the raw Valkey key holding the list-cache version counter. It is
+// read/written directly on rdb (INCR/GET), NOT through cache.Cache: the tiered
+// cache fronts L2 with a fixed-TTL L1 (tiered.go), so a version read through the
+// cache would be stale for up to the L1 TTL after a bump — defeating invalidation.
+const itemsVerKey = "items:listver"
+
 // Service is the business layer over the sqlc store. Every call runs under the
 // DB query timeout
 type Service struct {
-	pool     *pgxpool.Pool
 	q        *storedb.Queries
+	rdb      *redis.Client // raw client for the list-cache version counter; nil ⇒ atomic fallback
+	ver      atomic.Int64  // in-process version, used when rdb is nil (single-instance)
 	cache    cache.Cache
 	cacheTTL time.Duration
 	negTTL   time.Duration      // negative-cache (tombstone) TTL for absent ids (T28)
@@ -72,12 +81,47 @@ type Service struct {
 // read. The cache is fail-open (a Valkey outage reports a miss), so a cache
 // failure never surfaces as a 5xx — it just falls through to Postgres. A non-nil
 // presence filter short-circuits known-absent ids before any DB touch (T28); nil
-// disables it.
-func NewService(pool *pgxpool.Pool, c cache.Cache, ttl, negTTL time.Duration, presence *Presence) *Service {
-	return &Service{pool: pool, q: storedb.New(pool), cache: c, cacheTTL: ttl, negTTL: negTTL, presence: presence}
+// disables it. rdb is the raw Valkey client used only for the list-cache version
+// counter (nil ⇒ in-process atomic fallback).
+func NewService(pool *pgxpool.Pool, rdb *redis.Client, c cache.Cache, ttl, negTTL time.Duration, presence *Presence) *Service {
+	return &Service{q: storedb.New(pool), rdb: rdb, cache: c, cacheTTL: ttl, negTTL: negTTL, presence: presence}
 }
 
 func itemCacheKey(id int64) string { return fmt.Sprintf("item:%d", id) }
+func listCacheKey(ver int64, page, size int) string {
+	return fmt.Sprintf("items:list:%d:%d:%d", ver, page, size)
+}
+
+// listVersion returns the current list-cache version. Reads INCR-maintained
+// counter from Valkey (bypassing the cache tiers so a bump is seen immediately);
+// on a nil client or any error it falls back to the in-process counter. Fully
+// fail-open — a version read never fails a List.
+func (s *Service) listVersion(ctx context.Context) int64 {
+	if s.rdb == nil {
+		return s.ver.Load()
+	}
+	v, err := s.rdb.Get(ctx, itemsVerKey).Int64()
+	if err != nil {
+		return s.ver.Load() // miss (key absent) or outage ⇒ sentinel; List still serves
+	}
+	return v
+}
+
+// bumpVersion advances the list-cache version so every pre-write list key orphans
+// (they expire by TTL — no scan/delete). INCR on Valkey when present, else the
+// in-process counter. Fail-open: a bump failure never fails the write.
+//
+// ponytail: cross-instance invalidation needs Valkey — with rdb nil the atomic is
+// local, so a write on one instance will not invalidate another's list cache.
+func (s *Service) bumpVersion(ctx context.Context) {
+	if s.rdb == nil {
+		s.ver.Add(1)
+		return
+	}
+	if err := s.rdb.Incr(ctx, itemsVerKey).Err(); err != nil {
+		s.ver.Add(1) // outage ⇒ advance the local counter so this instance still invalidates
+	}
+}
 
 func (s *Service) Create(ctx context.Context, notes []byte) (storedb.Item, error) {
 	defer reqcontext.TrackService(ctx)()
@@ -96,6 +140,9 @@ func (s *Service) Create(ctx context.Context, notes []byte) (storedb.Item, error
 	if s.presence != nil {
 		s.presence.Add(item.ID)
 	}
+	// Invalidate cached list pages so the new item appears immediately (the old
+	// single-item key is unaffected — this is a fresh id).
+	s.bumpVersion(ctx)
 	return item, nil
 }
 
@@ -163,26 +210,64 @@ func (s *Service) Get(ctx context.Context, id int64) (storedb.Item, error) {
 	return v.(storedb.Item), nil
 }
 
+type listResult struct {
+	Items []storedb.Item `json:"items"`
+	Total int64          `json:"total"`
+}
+
 func (s *Service) List(ctx context.Context, page, size int) ([]storedb.Item, int64, error) {
 	defer reqcontext.TrackService(ctx)()
-	ctx, cancel := db.WithQueryTimeout(ctx)
-	defer cancel()
-	listFn := func(ctx context.Context, limit, offest int32) ([]storedb.Item, error) {
-		return s.q.ListItems(ctx, storedb.ListItemsParams{Limit: limit, Offset: offest})
+
+	ver := s.listVersion(ctx)
+	key := listCacheKey(ver, page, size)
+	if b, hit, _ := s.cache.Get(ctx, key); hit {
+		var lr listResult
+		if json.Unmarshal(b, &lr) == nil {
+			return lr.Items, lr.Total, nil
+		}
+		_ = s.cache.Delete(ctx, key)
 	}
-	// Approximate total from planner stats (O(1)) — exact count(*) Seq-Scans the
-	// whole table and no index fixes it. See store.CountItemsEstimate.
-	countFn := func(ctx context.Context) (int64, error) {
-		return store.CountItemsEstimate(ctx, s.pool, "items")
-	}
-	stopRepo := reqcontext.TrackRepo(ctx)
-	items, total, err := store.ListPaginated(ctx, countFn, listFn, page, size)
-	stopRepo()
+
+	lr, err := s.loadAndCache(ctx, key, page, size)
 	if err != nil {
 		return nil, 0, errs.NewInfrastructure(msgListFailed)
 	}
+	return lr.Items, lr.Total, nil
+}
 
-	return items, total, nil
+// loadAndCache recomputes one list page from the DB (count + rows), records it
+// under key, and returns it. Concurrent callers for the same key collapse via
+// singleflight so a boundary miss burst is one DB read, not M (T26). The TTL
+// avalanche (whole key set expiring together) is handled by L2 TTL jitter
+// (CACHE_TTL_JITTER_PCT), not XFetch — see benchmark-logbook rung-5 note.
+func (s *Service) loadAndCache(ctx context.Context, key string, page, size int) (listResult, error) {
+	v, err, _ := s.sf.Do(key, func() (any, error) {
+		qctx, cancel := db.WithQueryTimeout(ctx)
+		defer cancel()
+
+		listFn := func(ctx context.Context, limit, offset int32) ([]storedb.Item, error) {
+			return s.q.ListItems(ctx, storedb.ListItemsParams{Limit: limit, Offset: offset})
+		}
+		countFn := func(ctx context.Context) (int64, error) {
+			return s.q.CountItems(ctx)
+		}
+		stopRepo := reqcontext.TrackRepo(qctx)
+		items, total, err := store.ListPaginated(qctx, countFn, listFn, page, size)
+		stopRepo()
+		if err != nil {
+			return listResult{}, err
+		}
+
+		lr := listResult{Items: items, Total: total}
+		if b, err := json.Marshal(lr); err == nil {
+			_ = s.cache.Set(qctx, key, b, s.cacheTTL)
+		}
+		return lr, nil
+	})
+	if err != nil {
+		return listResult{}, err
+	}
+	return v.(listResult), nil
 }
 
 func (s *Service) SoftDelete(ctx context.Context, id int64) error {
@@ -196,6 +281,7 @@ func (s *Service) SoftDelete(ctx context.Context, id int64) error {
 		return errs.NewInfrastructure(msgSoftDeleteFailed)
 	}
 	_ = s.cache.Delete(ctx, itemCacheKey(id))
+	s.bumpVersion(ctx) // drop the item from cached list pages immediately
 	return nil
 }
 
@@ -211,5 +297,6 @@ func (s *Service) Delete(ctx context.Context, id int64) error {
 		return errs.NewInfrastructure(msgDeleteFailed)
 	}
 	_ = s.cache.Delete(ctx, itemCacheKey(id))
+	s.bumpVersion(ctx) // drop the item from cached list pages immediately
 	return nil
 }
